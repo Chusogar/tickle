@@ -17,6 +17,7 @@ PLAIN_OBJECTS = \
 	scramble.o \
 	vanguard.o \
 	vanguard_soundboard.o \
+	spectrum.o \
 	z80_ay3_soundboard.o
 
 OBJECTS = $(addprefix $(OBJDIR),$(PLAIN_OBJECTS))

@@ -83,6 +83,7 @@ bool SDLMain::init( const SDLMainOptions & options ) {
         }
         
         int ww = options_.w;
+		printf("DIM:%d X %d \n", options_.w, options_.h);
         int wh = options_.h;
         
         window_ = SDL_CreateWindow( "Tickle", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, ww, wh, window_flags_ );
