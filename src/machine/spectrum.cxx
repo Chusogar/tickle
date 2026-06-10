@@ -1,21 +1,10 @@
 /*
     ZX Spectrum 48K emulator driver for Tickle
-    Variant with readPort() trace
+    TAP support via real EAR emulation (ROM loader oriented)
 */
 
 #include "spectrum.h"
 #include <string.h>
-#include <stdio.h>
-
-// -----------------------------------------------------------------------------
-// Trace controls
-// -----------------------------------------------------------------------------
-#define ZX48K_TRACE_READPORT 0
-#define ZX48K_TRACE_READPORT_LIMIT 50000
-
-#if ZX48K_TRACE_READPORT
-static unsigned g_zx48k_readport_trace_count = 0;
-#endif
 
 // -----------------------------------------------------------------------------
 // Hardware constants
@@ -36,7 +25,19 @@ enum {
 
     BeeperAmplitude      = 6000,
 
-    Sna48kSize           = 49179
+    Sna48kSize           = 49179,
+
+    // Standard ROM timings
+    TapePilotPulse        = 2168,
+    TapeSync1Pulse        = 667,
+    TapeSync2Pulse        = 735,
+    TapeBit0Pulse         = 855,
+    TapeBit1Pulse         = 1710,
+    TapePilotHeaderPulses = 8063,
+    TapePilotDataPulses   = 3223,
+
+    // Small inter-block pause for TAP usability
+    TapeInterBlockPause   = CpuClock / 4
 };
 
 enum {
@@ -54,46 +55,174 @@ static TMachineInfo ZX48kInfo = {
 static TGameRegistrationHandler reg1( &ZX48kInfo, ZX48k::createInstance );
 
 // -----------------------------------------------------------------------------
-// Local helpers for trace
+// Tape helpers
 // -----------------------------------------------------------------------------
-#if ZX48K_TRACE_READPORT
-static void zx48k_trace_readport(
-    ZX48kBoard * b,
-    unsigned port,
-    unsigned pc,
-    unsigned char op_m2,
-    unsigned char op_m1,
-    unsigned char hi,
-    unsigned char result,
-    unsigned char selected_rows_mask
-)
+void ZX48kBoard::stopTapPlayback()
 {
-    if( g_zx48k_readport_trace_count >= ZX48K_TRACE_READPORT_LIMIT ) {
-        return;
+    tape_playing_ = false;
+    tape_state_ = TapeIdle;
+    tape_cycles_to_edge_ = 0;
+    tape_pilot_pulses_left_ = 0;
+    tape_block_len_ = 0;
+    tape_block_ptr_ = 0;
+    tape_byte_index_ = 0;
+    tape_bit_mask_ = 0;
+    tape_half_pulse_ = 0;
+    ear_level_ = 0;
+}
+
+bool ZX48kBoard::startNextTapBlock()
+{
+    if( tap_data_ == 0 || tap_pos_ >= tap_size_ ) {
+        return false;
     }
 
-    g_zx48k_readport_trace_count++;
+    if( tap_pos_ + 2 > tap_size_ ) {
+        stopTapPlayback();
+        tap_pos_ = tap_size_;
+        return false;
+    }
 
-    fprintf(
-        stderr,
-        "[ZX48K readPort] #%u PC=%04X port=%02X prev2=%02X prev1=%02X "
-        "A=%02X B=%02X hi=%02X rowsel=%02X result=%02X "
-        "rows=[%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X]\n",
-        g_zx48k_readport_trace_count,
-        pc & 0xFFFF,
-        port & 0xFF,
-        op_m2,
-        op_m1,
-        b->cpu_ ? b->cpu_->A : 0xFF,
-        b->cpu_ ? b->cpu_->B : 0xFF,
-        hi,
-        selected_rows_mask,
-        result,
-        b->key_row_[0], b->key_row_[1], b->key_row_[2], b->key_row_[3],
-        b->key_row_[4], b->key_row_[5], b->key_row_[6], b->key_row_[7]
-    );
+    unsigned block_len = tap_data_[tap_pos_] | (((unsigned)tap_data_[tap_pos_ + 1]) << 8);
+    unsigned block_off = tap_pos_ + 2;
+
+    if( block_len < 2 || block_off + block_len > tap_size_ ) {
+        stopTapPlayback();
+        tap_pos_ = tap_size_;
+        return false;
+    }
+
+    tape_block_ptr_ = tap_data_ + block_off;
+    tape_block_len_ = block_len;
+    tape_byte_index_ = 0;
+    tape_bit_mask_ = 0x80;
+    tape_half_pulse_ = 0;
+
+    // Header block uses long pilot, data block uses short pilot.
+    tape_pilot_pulses_left_ = (tape_block_ptr_[0] == 0x00) ? TapePilotHeaderPulses : TapePilotDataPulses;
+
+    tape_state_ = TapePilot;
+    tape_playing_ = true;
+    tape_cycles_to_edge_ = TapePilotPulse;
+
+    // Initial polarity does not matter for the ROM loader (edge-triggered),
+    // but start from low for determinism.
+    ear_level_ = 0;
+
+    // Advance tape position now: this block is current.
+    tap_pos_ = block_off + block_len;
+
+    return true;
 }
-#endif
+
+bool ZX48kBoard::rewindAndPlayTap()
+{
+    if( tap_data_ == 0 || tap_size_ == 0 ) {
+        return false;
+    }
+
+    tap_pos_ = 0;
+    stopTapPlayback();
+
+    // Start immediately from the first block.
+    return startNextTapBlock();
+}
+
+void ZX48kBoard::advanceTap( unsigned cycles )
+{
+    while( tape_playing_ && cycles > 0 ) {
+        if( cycles < tape_cycles_to_edge_ ) {
+            tape_cycles_to_edge_ -= cycles;
+            cycles = 0;
+            break;
+        }
+
+        cycles -= tape_cycles_to_edge_;
+
+        switch( tape_state_ ) {
+            case TapePilot:
+                ear_level_ ^= 1;
+                if( tape_pilot_pulses_left_ > 0 ) {
+                    tape_pilot_pulses_left_--;
+                }
+
+                if( tape_pilot_pulses_left_ > 0 ) {
+                    tape_cycles_to_edge_ = TapePilotPulse;
+                }
+                else {
+                    tape_state_ = TapeSync1;
+                    tape_cycles_to_edge_ = TapeSync1Pulse;
+                }
+                break;
+
+            case TapeSync1:
+                ear_level_ ^= 1;
+                tape_state_ = TapeSync2;
+                tape_cycles_to_edge_ = TapeSync2Pulse;
+                break;
+
+            case TapeSync2:
+                ear_level_ ^= 1;
+                tape_state_ = TapeData;
+                tape_byte_index_ = 0;
+                tape_bit_mask_ = 0x80;
+                tape_half_pulse_ = 0;
+                tape_cycles_to_edge_ =
+                    (tape_block_ptr_[tape_byte_index_] & tape_bit_mask_) ? TapeBit1Pulse : TapeBit0Pulse;
+                break;
+
+            case TapeData:
+            {
+                ear_level_ ^= 1;
+
+                unsigned pulse_len =
+                    (tape_block_ptr_[tape_byte_index_] & tape_bit_mask_) ? TapeBit1Pulse : TapeBit0Pulse;
+
+                if( tape_half_pulse_ == 0 ) {
+                    tape_half_pulse_ = 1;
+                    tape_cycles_to_edge_ = pulse_len;
+                }
+                else {
+                    tape_half_pulse_ = 0;
+                    tape_bit_mask_ >>= 1;
+
+                    if( tape_bit_mask_ == 0 ) {
+                        tape_bit_mask_ = 0x80;
+                        tape_byte_index_++;
+
+                        if( tape_byte_index_ >= tape_block_len_ ) {
+                            // End of current block -> pause before next block
+                            if( tap_pos_ < tap_size_ ) {
+                                tape_state_ = TapePause;
+                                tape_cycles_to_edge_ = TapeInterBlockPause;
+                            }
+                            else {
+                                stopTapPlayback();
+                            }
+                            break;
+                        }
+                    }
+
+                    tape_cycles_to_edge_ =
+                        (tape_block_ptr_[tape_byte_index_] & tape_bit_mask_) ? TapeBit1Pulse : TapeBit0Pulse;
+                }
+                break;
+            }
+
+            case TapePause:
+                ear_level_ = 0;
+                if( ! startNextTapBlock() ) {
+                    stopTapPlayback();
+                }
+                break;
+
+            case TapeIdle:
+            default:
+                stopTapPlayback();
+                break;
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // ZX48kBoard
@@ -115,12 +244,26 @@ ZX48kBoard::ZX48kBoard()
     frame_start_beeper_level_ = 0;
     beeper_event_count_ = 0;
 
+    tap_data_ = 0;
+    tap_size_ = 0;
+    tap_pos_ = 0;
+    tape_block_ptr_ = 0;
+    tape_block_len_ = 0;
+    tape_byte_index_ = 0;
+    tape_bit_mask_ = 0;
+    tape_half_pulse_ = 0;
+    tape_pilot_pulses_left_ = 0;
+    tape_cycles_to_edge_ = 0;
+    tape_playing_ = false;
+    tape_state_ = TapeIdle;
+
     clearKeyboard();
     reset();
 }
 
 ZX48kBoard::~ZX48kBoard()
 {
+    delete [] tap_data_;
     delete cpu_;
 }
 
@@ -181,11 +324,11 @@ void ZX48kBoard::reset()
     frame_start_beeper_level_ = 0;
     beeper_event_count_ = 0;
 
-    clearKeyboard();
+    // Keep tape loaded, rewind it, and stop playback
+    tap_pos_ = 0;
+    stopTapPlayback();
 
-#if ZX48K_TRACE_READPORT
-    g_zx48k_readport_trace_count = 0;
-#endif
+    clearKeyboard();
 }
 
 bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
@@ -195,25 +338,6 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
     }
 
     cpu_->reset();
-
-    // 48K SNA:
-    // 00 I
-    // 01-02 HL'
-    // 03-04 DE'
-    // 05-06 BC'
-    // 07-08 AF'
-    // 09-10 HL
-    // 11-12 DE
-    // 13-14 BC
-    // 15-16 IY
-    // 17-18 IX
-    // 19 IFF2
-    // 20 R
-    // 21-22 AF
-    // 23-24 SP
-    // 25 IM
-    // 26 Border
-    // 27.. RAM 48K
 
     memcpy( ram_, buf + 27, 0xC000 );
 
@@ -272,10 +396,10 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
         cpu_->SP += 2;
     }
 
-    // Approximate IFF recovery through a tiny instruction sequence
+    // Approximate IFF recovery
     {
         unsigned savePC = cpu_->PC;
-        unsigned scratch = 0x5B00;
+        unsigned scratch = 0x5B00; // safe RAM area on 48K Spectrum
         unsigned off = scratch - 0x4000;
 
         unsigned char b0 = ram_[off + 0];
@@ -304,9 +428,26 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
     frame_start_beeper_level_ = beeper_level_;
     clearKeyboard();
 
-#if ZX48K_TRACE_READPORT
-    g_zx48k_readport_trace_count = 0;
-#endif
+    return true;
+}
+
+bool ZX48kBoard::loadTap( const unsigned char * buf, unsigned len )
+{
+    delete [] tap_data_;
+    tap_data_ = 0;
+    tap_size_ = 0;
+    tap_pos_  = 0;
+
+    stopTapPlayback();
+
+    if( buf == 0 || len == 0 ) {
+        return false;
+    }
+
+    tap_data_ = new unsigned char[len];
+    memcpy( tap_data_, buf, len );
+    tap_size_ = len;
+    tap_pos_  = 0;
 
     return true;
 }
@@ -315,7 +456,15 @@ void ZX48kBoard::run()
 {
     beginAudioFrame();
 
-    cpu_->run( CpuCyclesPerFrame );
+    while( cpu_->getCycles() < CpuCyclesPerFrame ) {
+        unsigned before = cpu_->getCycles();
+        cpu_->step();
+        unsigned after = cpu_->getCycles();
+
+        if( after > before && tape_playing_ ) {
+            advanceTap( after - before );
+        }
+    }
 
     // Standard Spectrum maskable interrupt, once per frame.
     cpu_->interrupt( 0xFF );
@@ -351,13 +500,9 @@ unsigned char ZX48kBoard::readPort( unsigned port )
     if( (port & 0x01) == 0 ) {
         unsigned char result = 0xFF;
         unsigned char hi = 0xFF;
-        unsigned char selected_rows_mask = 0;
-        unsigned pc = 0;
-        unsigned char op_m2 = 0x00;
-        unsigned char op_m1 = 0x00;
 
         if( cpu_ != 0 ) {
-            pc = cpu_->PC & 0xFFFF;
+            unsigned pc = cpu_->PC & 0xFFFF;
 
             // Default for IN r,(C) / IN A,(C): high byte comes from B
             hi = cpu_->B;
@@ -366,15 +511,15 @@ unsigned char ZX48kBoard::readPort( unsigned port )
             // depending on when the callback happens, PC may already point
             // 1 or 2 bytes after the opcode fetch. Check both possibilities.
             if( pc >= 1 ) {
-                op_m1 = readByte( (pc - 1) & 0xFFFF );
-                if( op_m1 == 0xDB ) {
+                unsigned char p1 = readByte( (pc - 1) & 0xFFFF );
+                if( p1 == 0xDB ) {
                     hi = cpu_->A;
                 }
             }
 
             if( pc >= 2 ) {
-                op_m2 = readByte( (pc - 2) & 0xFFFF );
-                if( op_m2 == 0xDB ) {
+                unsigned char p2 = readByte( (pc - 2) & 0xFFFF );
+                if( p2 == 0xDB ) {
                     hi = cpu_->A;
                 }
             }
@@ -382,7 +527,6 @@ unsigned char ZX48kBoard::readPort( unsigned port )
 
         for( int row=0; row<8; row++ ) {
             if( ((hi >> row) & 0x01) == 0 ) {
-                selected_rows_mask |= (1 << row);
                 result &= (unsigned char)(0xE0 | key_row_[row]);
             }
         }
@@ -397,19 +541,6 @@ unsigned char ZX48kBoard::readPort( unsigned port )
 
         // Keep unrelated upper bits high
         result |= 0xA0;
-
-#if ZX48K_TRACE_READPORT
-        zx48k_trace_readport(
-            this,
-            port & 0xFF,
-            pc,
-            op_m2,
-            op_m1,
-            hi,
-            result,
-            selected_rows_mask
-        );
-#endif
 
         return result;
     }
@@ -481,6 +612,10 @@ bool ZX48k::setResourceFile( int id, const unsigned char * buf, unsigned len )
         return main_board_->loadSna48k( buf, len );
     }
 
+    if( id == EfSpectrumTape ) {
+        return main_board_->loadTap( buf, len );
+    }
+
     return 0 == resourceHandler()->handle( id, buf, len );
 }
 
@@ -488,7 +623,6 @@ bool ZX48k::handleInputEvent( unsigned device, unsigned param, void * data )
 {
     (void) data;
 
-    // Direct Spectrum key mapping
     if( device == idSpectrumKey ) {
         bool pressed = (param & 0x01) != 0;
         int row = (param >> 8) & 0x0F;
@@ -497,7 +631,6 @@ bool ZX48k::handleInputEvent( unsigned device, unsigned param, void * data )
         return true;
     }
 
-    // Combo mapping (cursors, delete, etc.)
     if( device == idSpectrumKeyCombo ) {
         bool pressed = (param & 0x01) != 0;
         int row1 = (param >> 24) & 0x0F;
@@ -507,6 +640,13 @@ bool ZX48k::handleInputEvent( unsigned device, unsigned param, void * data )
 
         main_board_->setKeyState( row1, bit1, pressed );
         main_board_->setKeyState( row2, bit2, pressed );
+        return true;
+    }
+
+    if( device == idSpectrumTapeControl ) {
+        if( param & 0x01 ) {
+            return main_board_->rewindAndPlayTap();
+        }
         return true;
     }
 

@@ -220,7 +220,6 @@ TMachine * loadGame( const char * name )
         bool ok = loadMachineFiles( m, badFiles );
 
         if( ! ok ) {
-            // Unable to load required files
             TString msg = "One or more files could not be loaded:\n";
             for( int i=0; i<badFiles.count(); i++ ) {
                 msg += "- ";
@@ -290,7 +289,6 @@ static void setupArcadeInputMappings( TEmuInputManager & inputManager, TJoystick
 
 static void setupSpectrumInputMappings( TEmuInputManager & inputManager )
 {
-    // ZX Spectrum matrix:
     // row 0: CAPS SHIFT, Z, X, C, V
     inputManager.add( SDLK_LSHIFT,     idSpectrumKey, ZX48K_KEY_DATA(0,0) );
     inputManager.add( SDLK_RSHIFT,     idSpectrumKey, ZX48K_KEY_DATA(0,0) );
@@ -349,11 +347,10 @@ static void setupSpectrumInputMappings( TEmuInputManager & inputManager )
     inputManager.add( SDLK_n,          idSpectrumKey, ZX48K_KEY_DATA(7,3) );
     inputManager.add( SDLK_b,          idSpectrumKey, ZX48K_KEY_DATA(7,4) );
 
-    // Useful combo conveniences:
-    // Backspace -> CAPS SHIFT + 0  (DELETE)
+    // BACKSPACE -> CAPS SHIFT + 0 (DELETE)
     inputManager.add( SDLK_BACKSPACE,  idSpectrumKeyCombo, ZX48K_KEYCOMBO_DATA(0,0,4,0) );
 
-    // Cursor helpers:
+    // Cursors:
     // Left  = CAPS SHIFT + 5
     // Down  = CAPS SHIFT + 6
     // Up    = CAPS SHIFT + 7
@@ -379,7 +376,8 @@ int main(int argc, char** argv) {
 
     const char * driver = 0;
     const char * snaPath = 0;
-    int scale = 1; // default behavior: x2 window size
+    const char * tapPath = 0;
+    int scale = 1; // default x2
 
     for( int i=1; i<argc; i++ ) {
         const char * a = argv[i];
@@ -397,6 +395,7 @@ int main(int argc, char** argv) {
             printf( "-fs          fullscreen mode (default is windowed)\n" );
             printf( "--scale=x    window scale factor (x1, x2, x3, ...)\n" );
             printf( "--sna=file   load ZX Spectrum 48K .sna snapshot after ROM load\n" );
+            printf( "--tap=file   load ZX Spectrum .tap tape image\n" );
             printf( "-list        list available drivers\n" );
             return EXIT_SUCCESS;
         }
@@ -417,6 +416,9 @@ int main(int argc, char** argv) {
         else if( ! strncmp(a, "--sna=", 6) ) {
             snaPath = a + 6;
         }
+        else if( ! strncmp(a, "--tap=", 6) ) {
+            tapPath = a + 6;
+        }
         else {
             driver = a;
         }
@@ -434,17 +436,6 @@ int main(int argc, char** argv) {
         printf( "No driver specified: entering logo mode. Press LCTRL+1+5 to enter test mode.\n" );
         printf( "(Use the -list option to get a list of drivers)\n");
         machine = TTickleMachine::create();
-    }
-
-	// Setup emulator input mappings
-    const TMachineDriverInfo * mdi = machine->getDriverInfo();
-    const char * loadedDriver = mdi->machineInfo()->driver;
-
-    if( loadedDriver != 0 && ! strcmp( loadedDriver, "zx48k" ) ) {
-        setupSpectrumInputMappings( inputManager );
-    }
-    else {
-        setupArcadeInputMappings( inputManager, joy );
     }
 
     // Optional external SNA load
@@ -476,7 +467,45 @@ int main(int argc, char** argv) {
         delete [] snaBuf;
     }
 
-    
+    // Optional external TAP load
+    if( tapPath != 0 ) {
+        const TMachineDriverInfo * mdi = machine->getDriverInfo();
+        const char * loadedDriver = mdi->machineInfo()->driver;
+
+        if( loadedDriver == 0 || strcmp( loadedDriver, "zx48k" ) != 0 ) {
+            printf( "--tap is only supported with the zx48k driver\n" );
+            delete machine;
+            return EXIT_FAILURE;
+        }
+
+        unsigned tapSize = 0;
+        unsigned char * tapBuf = loadRawFile( tapPath, &tapSize );
+        if( tapBuf == 0 ) {
+            printf( "Cannot load TAP file: %s\n", tapPath );
+            delete machine;
+            return EXIT_FAILURE;
+        }
+
+        if( ! machine->setResourceFile( EfSpectrumTape, tapBuf, tapSize ) ) {
+            printf( "Invalid or unsupported TAP file: %s\n", tapPath );
+            delete [] tapBuf;
+            delete machine;
+            return EXIT_FAILURE;
+        }
+
+        delete [] tapBuf;
+    }
+
+    // Setup emulator input mappings
+    const TMachineDriverInfo * mdi = machine->getDriverInfo();
+    const char * loadedDriver = mdi->machineInfo()->driver;
+
+    if( loadedDriver != 0 && ! strcmp( loadedDriver, "zx48k" ) ) {
+        setupSpectrumInputMappings( inputManager );
+    }
+    else {
+        setupArcadeInputMappings( inputManager, joy );
+    }
 
     // Initialize SDL
     const TMachineDriverInfo * info = machine->getDriverInfo();
@@ -491,6 +520,7 @@ int main(int argc, char** argv) {
 
     bool running;
     bool paused = false;
+    bool turbo = false;
 
     running = sdl.go( machine );
 
@@ -557,12 +587,35 @@ int main(int argc, char** argv) {
                                     sdl.audio_play();
                                 }
                                 break;
+
+                            case SDLK_F11:
+                                if( machine->handleInputEvent( idSpectrumTapeControl, 1, 0 ) ) {
+                                    printf( "Tape: REWIND + PLAY\n" );
+                                }
+                                else {
+                                    printf( "Tape control ignored (no TAP loaded or non-zx48k driver)\n" );
+                                }
+                                break;
+
+                            case SDLK_F12:
+                                turbo = ! turbo;
+                                printf( "Turbo mode: %s\n", turbo ? "ON" : "OFF" );
+                                break;
+                        
                         }
                     }
                     break;
 
                 default:
                     break;
+            }
+        }
+
+        // Turbo mode: process extra frames as fast as possible
+        if( turbo && ! paused ) {
+            for( int i=0; i<8; i++ ) {
+                inputManager.notifyJoysticks( machine );
+                sdl.add_frame( machine );
             }
         }
     }
