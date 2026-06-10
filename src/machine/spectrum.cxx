@@ -1,9 +1,21 @@
 /*
     ZX Spectrum 48K emulator driver for Tickle
+    Variant with readPort() trace
 */
 
 #include "spectrum.h"
 #include <string.h>
+#include <stdio.h>
+
+// -----------------------------------------------------------------------------
+// Trace controls
+// -----------------------------------------------------------------------------
+#define ZX48K_TRACE_READPORT 0
+#define ZX48K_TRACE_READPORT_LIMIT 50000
+
+#if ZX48K_TRACE_READPORT
+static unsigned g_zx48k_readport_trace_count = 0;
+#endif
 
 // -----------------------------------------------------------------------------
 // Hardware constants
@@ -40,6 +52,48 @@ static TMachineInfo ZX48kInfo = {
 };
 
 static TGameRegistrationHandler reg1( &ZX48kInfo, ZX48k::createInstance );
+
+// -----------------------------------------------------------------------------
+// Local helpers for trace
+// -----------------------------------------------------------------------------
+#if ZX48K_TRACE_READPORT
+static void zx48k_trace_readport(
+    ZX48kBoard * b,
+    unsigned port,
+    unsigned pc,
+    unsigned char op_m2,
+    unsigned char op_m1,
+    unsigned char hi,
+    unsigned char result,
+    unsigned char selected_rows_mask
+)
+{
+    if( g_zx48k_readport_trace_count >= ZX48K_TRACE_READPORT_LIMIT ) {
+        return;
+    }
+
+    g_zx48k_readport_trace_count++;
+
+    fprintf(
+        stderr,
+        "[ZX48K readPort] #%u PC=%04X port=%02X prev2=%02X prev1=%02X "
+        "A=%02X B=%02X hi=%02X rowsel=%02X result=%02X "
+        "rows=[%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X]\n",
+        g_zx48k_readport_trace_count,
+        pc & 0xFFFF,
+        port & 0xFF,
+        op_m2,
+        op_m1,
+        b->cpu_ ? b->cpu_->A : 0xFF,
+        b->cpu_ ? b->cpu_->B : 0xFF,
+        hi,
+        selected_rows_mask,
+        result,
+        b->key_row_[0], b->key_row_[1], b->key_row_[2], b->key_row_[3],
+        b->key_row_[4], b->key_row_[5], b->key_row_[6], b->key_row_[7]
+    );
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // ZX48kBoard
@@ -128,6 +182,10 @@ void ZX48kBoard::reset()
     beeper_event_count_ = 0;
 
     clearKeyboard();
+
+#if ZX48K_TRACE_READPORT
+    g_zx48k_readport_trace_count = 0;
+#endif
 }
 
 bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
@@ -136,10 +194,9 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
         return false;
     }
 
-    // Reset CPU core first, then overwrite full machine state.
     cpu_->reset();
 
-    // Header layout for 48K .SNA:
+    // 48K SNA:
     // 00 I
     // 01-02 HL'
     // 03-04 DE'
@@ -150,16 +207,13 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
     // 13-14 BC
     // 15-16 IY
     // 17-18 IX
-    // 19 IFF2 (bit 2 meaningful)
+    // 19 IFF2
     // 20 R
     // 21-22 AF
     // 23-24 SP
     // 25 IM
     // 26 Border
     // 27.. RAM 48K
-    //
-    // 48K .SNA stores the PC on the stack; the emulator must recover it from
-    // RAM at SP and then advance SP by two bytes.
 
     memcpy( ram_, buf + 27, 0xC000 );
 
@@ -205,7 +259,7 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
     ear_level_     = 0;
     frame_counter_ = 0;
 
-    // Recover PC from stack (48K SNA semantics)
+    // Recover PC from stack
     if( cpu_->SP < 0x4000 || cpu_->SP >= 0xFFFF ) {
         return false;
     }
@@ -218,21 +272,16 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
         cpu_->SP += 2;
     }
 
-    // Approximate RETN / IFF recovery:
-    // The file stores IFF2 semantics. This Z80 core does not expose a direct
-    // public setter for IFF flags, but we can still reproduce the intended end
-    // state by executing DI or EI(+NOP) from a scratch RAM location, then
-    // restoring PC to the snapshot entry point.
+    // Approximate IFF recovery through a tiny instruction sequence
     {
         unsigned savePC = cpu_->PC;
-        unsigned scratch = 0x5B00; // safe RAM area on 48K Spectrum
+        unsigned scratch = 0x5B00;
         unsigned off = scratch - 0x4000;
 
         unsigned char b0 = ram_[off + 0];
         unsigned char b1 = ram_[off + 1];
 
         if( iff2 & 0x04 ) {
-            // EI becomes effective after the next instruction, so execute EI;NOP
             ram_[off + 0] = 0xFB; // EI
             ram_[off + 1] = 0x00; // NOP
             cpu_->PC = scratch;
@@ -251,10 +300,13 @@ bool ZX48kBoard::loadSna48k( const unsigned char * buf, unsigned len )
         cpu_->PC = savePC;
     }
 
-    // Reset transient runtime state, but preserve loaded machine snapshot.
     beeper_event_count_ = 0;
     frame_start_beeper_level_ = beeper_level_;
     clearKeyboard();
+
+#if ZX48K_TRACE_READPORT
+    g_zx48k_readport_trace_count = 0;
+#endif
 
     return true;
 }
@@ -287,7 +339,6 @@ void ZX48kBoard::writeByte( unsigned addr, unsigned char value )
     addr &= 0xFFFF;
 
     if( addr < 0x4000 ) {
-        // ROM
         return;
     }
 
@@ -297,19 +348,41 @@ void ZX48kBoard::writeByte( unsigned addr, unsigned char value )
 unsigned char ZX48kBoard::readPort( unsigned port )
 {
     // ULA responds to any even port.
-    // Tickle's port callback exposes only the low 8 bits, but the Z80 registers
-    // are public, so for keyboard scanning through IN A,(C) we can use B as the
-    // row selector (high byte of BC), which is what the Spectrum ROM normally uses.
     if( (port & 0x01) == 0 ) {
         unsigned char result = 0xFF;
         unsigned char hi = 0xFF;
+        unsigned char selected_rows_mask = 0;
+        unsigned pc = 0;
+        unsigned char op_m2 = 0x00;
+        unsigned char op_m1 = 0x00;
 
         if( cpu_ != 0 ) {
+            pc = cpu_->PC & 0xFFFF;
+
+            // Default for IN r,(C) / IN A,(C): high byte comes from B
             hi = cpu_->B;
+
+            // Heuristic for IN A,(n) (opcode DB nn):
+            // depending on when the callback happens, PC may already point
+            // 1 or 2 bytes after the opcode fetch. Check both possibilities.
+            if( pc >= 1 ) {
+                op_m1 = readByte( (pc - 1) & 0xFFFF );
+                if( op_m1 == 0xDB ) {
+                    hi = cpu_->A;
+                }
+            }
+
+            if( pc >= 2 ) {
+                op_m2 = readByte( (pc - 2) & 0xFFFF );
+                if( op_m2 == 0xDB ) {
+                    hi = cpu_->A;
+                }
+            }
         }
 
         for( int row=0; row<8; row++ ) {
             if( ((hi >> row) & 0x01) == 0 ) {
+                selected_rows_mask |= (1 << row);
                 result &= (unsigned char)(0xE0 | key_row_[row]);
             }
         }
@@ -324,6 +397,19 @@ unsigned char ZX48kBoard::readPort( unsigned port )
 
         // Keep unrelated upper bits high
         result |= 0xA0;
+
+#if ZX48K_TRACE_READPORT
+        zx48k_trace_readport(
+            this,
+            port & 0xFF,
+            pc,
+            op_m2,
+            op_m1,
+            hi,
+            result,
+            selected_rows_mask
+        );
+#endif
 
         return result;
     }

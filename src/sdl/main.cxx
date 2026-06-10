@@ -436,6 +436,17 @@ int main(int argc, char** argv) {
         machine = TTickleMachine::create();
     }
 
+	// Setup emulator input mappings
+    const TMachineDriverInfo * mdi = machine->getDriverInfo();
+    const char * loadedDriver = mdi->machineInfo()->driver;
+
+    if( loadedDriver != 0 && ! strcmp( loadedDriver, "zx48k" ) ) {
+        setupSpectrumInputMappings( inputManager );
+    }
+    else {
+        setupArcadeInputMappings( inputManager, joy );
+    }
+
     // Optional external SNA load
     if( snaPath != 0 ) {
         const TMachineDriverInfo * mdi = machine->getDriverInfo();
@@ -465,16 +476,7 @@ int main(int argc, char** argv) {
         delete [] snaBuf;
     }
 
-    // Setup emulator input mappings
-    const TMachineDriverInfo * mdi = machine->getDriverInfo();
-    const char * loadedDriver = mdi->machineInfo()->driver;
-
-    if( loadedDriver != 0 && ! strcmp( loadedDriver, "zx48k" ) ) {
-        setupSpectrumInputMappings( inputManager );
-    }
-    else {
-        setupArcadeInputMappings( inputManager, joy );
-    }
+    
 
     // Initialize SDL
     const TMachineDriverInfo * info = machine->getDriverInfo();
