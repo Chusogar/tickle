@@ -20,7 +20,6 @@ enum {
 
 // -----------------------------------------------------------------------------
 // Custom resource ids used to pass external buffers to the driver.
-// These are meant for command-line loaded files such as --sna= and --tap=.
 // -----------------------------------------------------------------------------
 enum {
     EfSpectrumSnapshot = 0x7F00,
@@ -29,8 +28,6 @@ enum {
 
 // -----------------------------------------------------------------------------
 // Encoding helpers used by main.c.
-// The low bit is reserved for press/release state because TEmuInputManager
-// forwards data|param where param is 0 or 1.
 // -----------------------------------------------------------------------------
 #define ZX48K_KEY_DATA(row,bit) \
     ((((unsigned)(row) & 0x0F) << 8) | (((unsigned)(bit) & 0x0F) << 4))
@@ -41,9 +38,6 @@ enum {
      (((unsigned)(row2) & 0x0F) << 16) | \
      (((unsigned)(bit2) & 0x0F) << 12))
 
-// -----------------------------------------------------------------------------
-// Small wrapper exposing interrupt mode setter from the Z80 core.
-// -----------------------------------------------------------------------------
 class ZX48kCpu : public Z80
 {
 public:
@@ -55,9 +49,6 @@ public:
     }
 };
 
-// -----------------------------------------------------------------------------
-// Main machine board: memory map, ULA I/O, keyboard matrix, tape and beeper.
-// -----------------------------------------------------------------------------
 struct ZX48kBoard : public Z80Environment
 {
     ZX48kBoard();
@@ -84,11 +75,15 @@ struct ZX48kBoard : public Z80Environment
     bool loadSna48k( const unsigned char * buf, unsigned len );
     bool loadTap( const unsigned char * buf, unsigned len );
 
-    // TAP playback through EAR (ROM loader oriented)
+    // TAP playback through EAR (hybrid:
+    // real EAR state + exact ROM LD-BYTES handoff)
     void stopTapPlayback();
     bool startNextTapBlock();
+    bool armTapPlayback();
     bool rewindAndPlayTap();
     void advanceTap( unsigned cycles );
+    bool parseNextTapBlock( const unsigned char ** blk, unsigned * block_len );
+    bool handleTapTrap();
 
     enum TTapeState {
         TapeIdle,
@@ -137,14 +132,12 @@ struct ZX48kBoard : public Z80Environment
     unsigned tape_pilot_pulses_left_;
     unsigned tape_cycles_to_edge_;
     bool tape_playing_;
+    bool tape_armed_;
     TTapeState tape_state_;
 
     ZX48kCpu * cpu_;
 };
 
-// -----------------------------------------------------------------------------
-// Tickle machine wrapper
-// -----------------------------------------------------------------------------
 class ZX48k : public TStandardMachine
 {
 public:

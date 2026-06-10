@@ -1,6 +1,6 @@
 /*
     ZX Spectrum 48K emulator driver for Tickle
-    TAP support via real EAR emulation (ROM loader oriented)
+    TAP support via real EAR emulation only
 */
 
 #include "spectrum.h"
@@ -10,22 +10,22 @@
 // Hardware constants
 // -----------------------------------------------------------------------------
 enum {
-    ScreenWidth          = 320,      // 256 + borders
-    ScreenHeight         = 240,      // 192 + borders
-    ScreenColors         = 16,
-    VideoFrequency       = 50,
-    CpuClock             = 3500000,
-    CpuCyclesPerFrame    = CpuClock / VideoFrequency,
+    ScreenWidth           = 320,      // 256 + borders
+    ScreenHeight          = 240,      // 192 + borders
+    ScreenColors          = 16,
+    VideoFrequency        = 50,
+    CpuClock              = 3500000,
+    CpuCyclesPerFrame     = CpuClock / VideoFrequency,
 
-    SpectrumWidth        = 256,
-    SpectrumHeight       = 192,
+    SpectrumWidth         = 256,
+    SpectrumHeight        = 192,
 
-    BorderLeft           = 32,
-    BorderTop            = 24,
+    BorderLeft            = 32,
+    BorderTop             = 24,
 
-    BeeperAmplitude      = 6000,
+    BeeperAmplitude       = 6000,
 
-    Sna48kSize           = 49179,
+    Sna48kSize            = 49179,
 
     // Standard ROM timings
     TapePilotPulse        = 2168,
@@ -36,8 +36,9 @@ enum {
     TapePilotHeaderPulses = 8063,
     TapePilotDataPulses   = 3223,
 
-    // Small inter-block pause for TAP usability
-    TapeInterBlockPause   = CpuClock / 4
+    // Inter-block / end-of-tape pauses (stable level, no extra edges)
+    TapeInterBlockPause   = CpuClock / 4,   // ~250 ms
+    TapeEndPause          = CpuClock / 2    // ~500 ms
 };
 
 enum {
@@ -68,7 +69,58 @@ void ZX48kBoard::stopTapPlayback()
     tape_byte_index_ = 0;
     tape_bit_mask_ = 0;
     tape_half_pulse_ = 0;
-    ear_level_ = 0;
+    // do not force an immediate level change here
+}
+
+bool ZX48kBoard::armTapPlayback()
+{
+    if( tap_data_ == 0 || tap_size_ == 0 ) {
+        return false;
+    }
+
+    stopTapPlayback();
+    tape_armed_ = true;
+    return true;
+}
+
+bool ZX48kBoard::rewindAndPlayTap()
+{
+    if( tap_data_ == 0 || tap_size_ == 0 ) {
+        return false;
+    }
+
+    tap_pos_ = 0;
+    stopTapPlayback();
+
+    // F11 should really behave as REWIND + PLAY
+    tape_armed_ = true;
+    return startNextTapBlock();
+}
+
+bool ZX48kBoard::parseNextTapBlock( const unsigned char ** blk, unsigned * block_len )
+{
+    if( blk == 0 || block_len == 0 ) {
+        return false;
+    }
+
+    if( tap_data_ == 0 || tap_pos_ >= tap_size_ ) {
+        return false;
+    }
+
+    if( tap_pos_ + 2 > tap_size_ ) {
+        return false;
+    }
+
+    unsigned len = tap_data_[tap_pos_] | (((unsigned)tap_data_[tap_pos_ + 1]) << 8);
+    unsigned off = tap_pos_ + 2;
+
+    if( len < 2 || off + len > tap_size_ ) {
+        return false;
+    }
+
+    *blk = tap_data_ + off;
+    *block_len = len;
+    return true;
 }
 
 bool ZX48kBoard::startNextTapBlock()
@@ -98,34 +150,20 @@ bool ZX48kBoard::startNextTapBlock()
     tape_bit_mask_ = 0x80;
     tape_half_pulse_ = 0;
 
-    // Header block uses long pilot, data block uses short pilot.
+    // Header block uses long pilot, data block uses short pilot
     tape_pilot_pulses_left_ = (tape_block_ptr_[0] == 0x00) ? TapePilotHeaderPulses : TapePilotDataPulses;
 
     tape_state_ = TapePilot;
     tape_playing_ = true;
     tape_cycles_to_edge_ = TapePilotPulse;
 
-    // Initial polarity does not matter for the ROM loader (edge-triggered),
-    // but start from low for determinism.
+    // Initial polarity does not matter for the ROM loader
     ear_level_ = 0;
 
-    // Advance tape position now: this block is current.
+    // Advance tape position: this block is now "current"
     tap_pos_ = block_off + block_len;
 
     return true;
-}
-
-bool ZX48kBoard::rewindAndPlayTap()
-{
-    if( tap_data_ == 0 || tap_size_ == 0 ) {
-        return false;
-    }
-
-    tap_pos_ = 0;
-    stopTapPlayback();
-
-    // Start immediately from the first block.
-    return startNextTapBlock();
 }
 
 void ZX48kBoard::advanceTap( unsigned cycles )
@@ -191,14 +229,9 @@ void ZX48kBoard::advanceTap( unsigned cycles )
                         tape_byte_index_++;
 
                         if( tape_byte_index_ >= tape_block_len_ ) {
-                            // End of current block -> pause before next block
-                            if( tap_pos_ < tap_size_ ) {
-                                tape_state_ = TapePause;
-                                tape_cycles_to_edge_ = TapeInterBlockPause;
-                            }
-                            else {
-                                stopTapPlayback();
-                            }
+                            // end of current block -> stable pause
+                            tape_state_ = TapePause;
+                            tape_cycles_to_edge_ = (tap_pos_ < tap_size_) ? TapeInterBlockPause : TapeEndPause;
                             break;
                         }
                     }
@@ -210,15 +243,24 @@ void ZX48kBoard::advanceTap( unsigned cycles )
             }
 
             case TapePause:
-                ear_level_ = 0;
-                if( ! startNextTapBlock() ) {
+                // Keep EAR stable during pause
+                if( tap_pos_ < tap_size_ ) {
+                    if( ! startNextTapBlock() ) {
+                        stopTapPlayback();
+                        tape_armed_ = false;
+                    }
+                }
+                else {
+                    // End of tape after trailing silence
                     stopTapPlayback();
+                    tape_armed_ = false;
                 }
                 break;
 
             case TapeIdle:
             default:
                 stopTapPlayback();
+                tape_armed_ = false;
                 break;
         }
     }
@@ -255,6 +297,7 @@ ZX48kBoard::ZX48kBoard()
     tape_pilot_pulses_left_ = 0;
     tape_cycles_to_edge_ = 0;
     tape_playing_ = false;
+    tape_armed_ = false;
     tape_state_ = TapeIdle;
 
     clearKeyboard();
@@ -327,6 +370,8 @@ void ZX48kBoard::reset()
     // Keep tape loaded, rewind it, and stop playback
     tap_pos_ = 0;
     stopTapPlayback();
+    tape_armed_ = false;
+    ear_level_ = 0;
 
     clearKeyboard();
 }
@@ -439,6 +484,8 @@ bool ZX48kBoard::loadTap( const unsigned char * buf, unsigned len )
     tap_pos_  = 0;
 
     stopTapPlayback();
+    tape_armed_ = false;
+    ear_level_ = 0;
 
     if( buf == 0 || len == 0 ) {
         return false;
@@ -452,15 +499,22 @@ bool ZX48kBoard::loadTap( const unsigned char * buf, unsigned len )
     return true;
 }
 
+// Disabled in EAR-only mode
+bool ZX48kBoard::handleTapTrap()
+{
+    return false;
+}
+
 void ZX48kBoard::run()
 {
     beginAudioFrame();
 
     while( cpu_->getCycles() < CpuCyclesPerFrame ) {
         unsigned before = cpu_->getCycles();
-        cpu_->step();
-        unsigned after = cpu_->getCycles();
 
+        cpu_->step();
+
+        unsigned after = cpu_->getCycles();
         if( after > before && tape_playing_ ) {
             advanceTap( after - before );
         }
