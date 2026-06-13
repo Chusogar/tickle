@@ -167,6 +167,7 @@ Supported arcades:
 | atlantis | Battle of Atlantis | 1981 | Comsoft | atlantis.zip, scramble.zip |
 | blkhole | Black Hole | 1981 | TDS | blkhole.zip, galaxian.zip |
 | crush | Crush Roller | 1981 | Kural Samno Electric | crush.zip, puckman.zip |
+| elevatob | Elevator Action (bootleg) | 1983 | Taito | elevatob.zip |
 | eyes | Eyes | 1982 | Rock-Ola | eyes.zip, puckman.zip |
 | fantasyu | Fantasy (US) | 1981 | Rock-Ola | fantasyu.zip, fantasy.zip, nibbler.zip |
 | frogger | Frogger | 1981 | Konami | frogger.zip |
