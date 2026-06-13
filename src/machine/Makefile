@@ -1,5 +1,6 @@
 PLAIN_OBJECTS = \
 	1942.o \
+	elevator_action.o \
 	fantasy.o \
 	frogger.o \
 	galaga.o \

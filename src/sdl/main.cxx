@@ -24,6 +24,7 @@ const wchar_t PATH_SEPARATOR = '/';
 // For some reasons g++ may get confused by the indirect reference and will not link the machines
 // (this happens e.g. on the RPI) so we have to include them explicitly.
 #include <machine/1942.h>
+#include <machine/elevator_action.h>
 #include <machine/fantasy.h>
 #include <machine/frogger.h>
 #include <machine/galaga.h>
@@ -42,6 +43,7 @@ const wchar_t PATH_SEPARATOR = '/';
 void dummy()
 {
     delete M1942::createInstance();
+    delete ElevatorAction::createInstance();
     delete Fantasy::createInstance();
     delete Frogger::createInstance();
     delete Galaga::createInstance();
