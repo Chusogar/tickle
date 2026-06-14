@@ -5,6 +5,7 @@ PLAIN_OBJECTS = \
 	galaga.o \
 	galaxian.o \
 	galaxian_soundboard.o \
+	gng.o \
 	invaders.o \
 	namco05.o \
 	namco51.o \

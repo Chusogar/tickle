@@ -151,6 +151,7 @@ Note: executable depends on `SDL2.dll`. This library is copied inside `obj` duri
 Supported CPUs:
 * 6502
 * 8080
+* M6809
 * Z80
 
 Supported sound chips:
@@ -172,6 +173,7 @@ Supported arcades:
 | frogger | Frogger | 1981 | Konami | frogger.zip |
 | galaga | Galaga | 1981 | Namco | galaga.zip |
 | galaxian | Galaxian | 1979 | Namco | galaxian.zip |
+| gng | Ghosts'n Goblins | 1985 | Capcom | gng.zip |
 | gteikoku | Gingateikoku No Gyakushu | 1980 | Irem | gteikoku.zip, uniwars.zip, galaxian.zip |
 | jumpshot | Jump Shot | 1985 | Bally Midway | jumpshot.zip, puckman.zip |
 | lrescue | Lunar Rescue | 1979 | Taito | lrescue.zip, invaders.zip |
