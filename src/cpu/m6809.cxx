@@ -347,20 +347,20 @@ void M6809::do_firq()
 
 void M6809::irq()
 {
-    irq_state_ = 1;
     if( !(CC & FlagI) ) {
         int_state_ &= ~StateSYNC;
         do_irq();
     }
+    irq_state_ = 0;
 }
 
 void M6809::firq()
 {
-    firq_state_ = 1;
     if( !(CC & FlagF) ) {
         int_state_ &= ~StateSYNC;
         do_firq();
     }
+    firq_state_ = 0;
 }
 
 void M6809::nmi()

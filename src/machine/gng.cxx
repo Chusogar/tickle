@@ -51,11 +51,13 @@ static TGameRegistrationHandler reg( &GnGInfo, GnG::createInstance );
 // ---------------------------------------------------------------------------
 // Palette conversion: RRRRGGGGBBBBxxxx split across two RAM banks
 // ---------------------------------------------------------------------------
-static void decodePalette( TPalette * palette, const unsigned char * palram1,
-                           const unsigned char * palram2, int index )
+// palram_split1 at 0x3800 = RRRR GGGG (high byte)
+// palram_split2 at 0x3900 = BBBB xxxx (low byte)
+static void decodePalette( TPalette * palette, const unsigned char * split1,
+                           const unsigned char * split2, int index )
 {
-    unsigned char hi = palram1[index];
-    unsigned char lo = palram2[index];
+    unsigned char hi = split1[index]; // RRRR GGGG
+    unsigned char lo = split2[index]; // BBBB xxxx
 
     int r = (hi >> 4) & 0x0F;
     int g = hi & 0x0F;
@@ -143,8 +145,13 @@ void GnGSoundBoard::playSound( TMixer * mixer, unsigned len, unsigned samplingRa
     TMixerBuffer * mixerBuffer = mixer->getBuffer( chMono, len, 8 );
     int * dataBuffer = mixerBuffer->data();
 
+    // MAME uses interrupt,4 -> 4 IRQs per frame, trigger every 3 steps
     for( unsigned i = 1; i < samplingSteps; i++ ) {
         cpu_->run( cyclesPerStep );
+
+        if( (i % 3) == 0 ) {
+            cpu_->interrupt( 0xFF );
+        }
 
         ym_[0].playSound( dataBuffer, stepSize, samplingRate );
         ym_[1].playSound( dataBuffer, stepSize, samplingRate );
@@ -154,6 +161,7 @@ void GnGSoundBoard::playSound( TMixer * mixer, unsigned len, unsigned samplingRa
 
     stepSize = len - stepSize * (samplingSteps - 1);
     cpu_->run( cyclesPerStep );
+    cpu_->interrupt( 0xFF );
 
     ym_[0].playSound( dataBuffer, stepSize, samplingRate );
     ym_[1].playSound( dataBuffer, stepSize, samplingRate );
@@ -176,7 +184,7 @@ GnGMainBoard::GnGMainBoard( GnGSoundBoard * sound_board )
     memset( bgscrollx_, 0, sizeof(bgscrollx_) );
     memset( bgscrolly_, 0, sizeof(bgscrolly_) );
     flipscreen_ = 0;
-    bankselect_ = 4;
+    bankselect_ = 0;
     port_in0_ = 0xFF;
     port_in1_ = 0xFF;
     port_in2_ = 0xFF;
@@ -192,7 +200,7 @@ GnGMainBoard::~GnGMainBoard()
 void GnGMainBoard::reset()
 {
     cpu_->reset();
-    bankselect_ = 4;
+    bankselect_ = 0;
     flipscreen_ = 0;
     memset( bgscrollx_, 0, sizeof(bgscrollx_) );
     memset( bgscrolly_, 0, sizeof(bgscrolly_) );
@@ -257,13 +265,9 @@ unsigned char GnGMainBoard::readByte( unsigned addr )
     if( addr == 0x3C00 )
         return 0; // watchdog
 
-    // Banked ROM: 0x4000-0x5FFF
+    // Banked ROM: 0x4000-0x5FFF (gg5.bin pages at 0x10000)
     if( addr >= 0x4000 && addr < 0x6000 ) {
-        if( bankselect_ == 4 ) {
-            return rom_[addr]; // page 4 is at 0x4000 in ROM
-        } else {
-            return rom_[0x10000 + (bankselect_ & 3) * 0x2000 + (addr - 0x4000)];
-        }
+        return rom_[0x10000 + (bankselect_ & 3) * 0x2000 + (addr - 0x4000)];
     }
 
     // Fixed ROM: 0x6000-0xFFFF (mapped at offset 0x6000 in rom_ since ROM is loaded at 0x8000)
@@ -343,9 +347,9 @@ void GnGMainBoard::writeByte( unsigned addr, unsigned char value )
 // ---------------------------------------------------------------------------
 GnG::GnG() :
     main_board_( &sound_board_ ),
-    char_data_( 8, 8 * 512 ),
-    tile_data_( 16, 16 * 512 ),
-    sprite_data_( 16, 16 * 384 )
+    char_data_( 8, 8 * 1024 ),
+    tile_data_( 16, 16 * 1024 ),
+    sprite_data_( 16, 16 * 768 )
 {
     createScreen( ScreenVisibleWidth, ScreenVisibleHeight, ScreenColors );
 
@@ -494,203 +498,88 @@ void GnG::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingRate )
 // ---------------------------------------------------------------------------
 
 /*
-    Characters: 8x8, 2bpp
-    Layout from MAME:
-      planes: { 4, 0 }
-      xoffs:  { 0,1,2,3, 8+0,8+1,8+2,8+3 }
-      yoffs:  { 0*16,1*16,...,7*16 }
-      charincrement: 16*8
-    Total chars = ROM_size / (16*8/8) = 0x4000 / 16 = 1024
-    But RGN_FRAC(1,1) means full region = 0x4000 bytes, total = 0x4000*8/(8*8*2) = 512 chars
+    MAME GfxLayout bit extraction:
+      For each pixel at (x,y) in element c:
+        For each plane p with plane_offset[p]:
+          global_bit = element_start + plane_offset[p] + yoffs[y] + xoffs[x]
+          pixel_bit_p = (src[global_bit/8] >> (global_bit%8)) & 1
+      plane[0] = LSB, plane[N-1] = MSB
+
+    Characters: 8x8, 2bpp, 16 bytes/char
+      planes={4,0}, xoffs={0,1,2,3,8,9,10,11}, yoffs={0,16,...,112}
 */
 static void decodeGnGChars( unsigned char * dst, const unsigned char * src, int count )
 {
     for( int c = 0; c < count; c++ ) {
-        int base = c * 16; // 16 bytes per char
+        const unsigned char * s = src + c * 16;
+        unsigned char * d = dst + c * 64;
         for( int y = 0; y < 8; y++ ) {
-            unsigned char byte0 = src[base + y * 2];
-            unsigned char byte1 = src[base + y * 2 + 1];
+            unsigned char b0 = s[y * 2];
+            unsigned char b1 = s[y * 2 + 1];
+            // xoffs 0..3 from b0, xoffs 8..11 from b1
+            // plane[0]=offset 4 (LSB), plane[1]=offset 0 (MSB)
             for( int x = 0; x < 4; x++ ) {
-                int bit = 3 - x;
-                int p0 = (byte0 >> bit) & 1;
-                int p1 = (byte0 >> (bit + 4)) & 1;
-                dst[c * 64 + y * 8 + x] = p0 | (p1 << 1);
+                int p0 = (b0 >> (x + 4)) & 1;
+                int p1 = (b0 >> x) & 1;
+                d[y * 8 + x] = p0 | (p1 << 1);
             }
             for( int x = 0; x < 4; x++ ) {
-                int bit = 3 - x;
-                int p0 = (byte1 >> bit) & 1;
-                int p1 = (byte1 >> (bit + 4)) & 1;
-                dst[c * 64 + y * 8 + 4 + x] = p0 | (p1 << 1);
+                int p0 = (b1 >> (x + 4)) & 1;
+                int p1 = (b1 >> x) & 1;
+                d[y * 8 + 4 + x] = p0 | (p1 << 1);
             }
         }
     }
 }
 
 /*
-    Tiles: 16x16, 3bpp
-    Layout from MAME:
-      RGN_FRAC(1,3) tiles, 3 planes at { RGN_FRAC(2,3), RGN_FRAC(1,3), RGN_FRAC(0,3) }
-      xoffs: { 0,1,2,3,4,5,6,7, 16*8+0,...,16*8+7 }
-      yoffs: { 0*8,1*8,...,7*8, 8*8,...,15*8 }
-      charincrement: 32*8 = 256 bits = 32 bytes
-    Total region = 0x18000, each plane = 0x8000, tiles_per_plane = 0x8000/32 = 1024
-    But with 3 planes only 0x8000/32 = 1024 tiles... wait, MAME says RGN_FRAC(1,3)
-    so count = 0x18000/3/32 = 0x8000/32 = 256 tiles
-    Actually: region=0x18000, RGN_FRAC(1,3) = 0x18000/3 = 0x8000 per plane
-    Each tile = 32 bytes, so 0x8000/32 = 1024... but divided? No.
-    tiles = region_size / 3 / 32 bytes = 0x18000/(3*32) = 0x8000/32 = 1024?
-    Hmm wait: RGN_FRAC(1,3) means total_gfx_elements = region_size / (charincrement/8)
-    charincrement = 32*8 bits = 32 bytes. RGN_FRAC(1,3) = region/3 elements...
-    No: in MAME, the count field is RGN_FRAC(1,3) which equals region_size/3/(charincrement/8)
-    region_size = 0x18000, charincrement = 256 bits = 32 bytes
-    count = (0x18000/3) / 32 = 0x8000/32 = 1024
-
-    Wait: that's wrong. RGN_FRAC(1,3) is the number of tiles.
-    num_tiles = total_region_bytes / 3 / bytes_per_tile_per_plane
-    bytes_per_tile_per_plane = 32
-    num_tiles = 0x18000 / 3 / 32 = 0x8000 / 32 = 1024
-
-    Actually rechecking: RGN_FRAC is about the count of graphics elements.
-    Each element uses charincrement bits across the planes. The planes reference
-    different offsets in the region. So:
-    Plane offsets (in bits): RGN_FRAC(2,3)=0x10000*8, RGN_FRAC(1,3)=0x8000*8, RGN_FRAC(0,3)=0
-    bytes_per_tile = 32 (across each plane chunk)
-    num_tiles = 0x18000 / 3 / 32 = 1024
-
-    Hmm but actually looking more carefully: region = 0x18000 bytes
-    The number of tiles is specified by the count field in GfxLayout which is RGN_FRAC(1,3).
-    RGN_FRAC(1,3) = region_size * 1/3 / (charincrement/8)
-    = 0x18000/3 / 32 = 0x8000/32 = 1024
-
-    Let me re-verify: 6 ROMs of 0x4000 each = 0x18000 total.
-    3 planes: plane0 = gg11+gg10 (0x8000), plane1 = gg9+gg8 (0x8000), plane2 = gg7+gg6 (0x8000)
-    Each tile is 16x16 = 32 bytes per plane. Tiles = 0x8000/32 = 256.
-
-    Wait that's 256! 0x8000 / 32 = 1024/4 = 256. Let me recalculate:
-    0x8000 = 32768. 32768 / 32 = 1024. Hmm 32768/32 = 1024. That's 1024 tiles!
-    Actually 0x8000 = 32768. 32768/32 = 1024. So 1024 tiles, which is fine.
-    But actually each plane occupies 0x8000 bytes and each tile takes 32 bytes from each plane.
-    So max tiles = 0x8000/32 = 1024. But RGN_FRAC(1,3) is also 0x8000/32=1024. OK so 1024 tiles.
-
-    Let me just be safe and use the actual data: region has 0x18000 bytes, 3 planes of 0x8000
-    each. 0x8000/32 = 256 tiles per... no, 32768/32=1024. OK it's definitely 1024 tiles.
-
-    Wait I was confusing hex and decimal: 0x8000 = 32768, 32768/32 = 1024 tiles. Yes.
+    Tiles: 16x16, 3bpp, 32 bytes/tile, 1024 tiles
+      planes={RGN_FRAC(2,3), RGN_FRAC(1,3), RGN_FRAC(0,3)} = byte offsets {0x10000, 0x8000, 0}
+      plane[0] LSB at 0x10000, plane[2] MSB at 0
+      xoffs={0,1,2,3,4,5,6,7, 128,...,135}, yoffs={0,8,...,120}
+      x<8: byte=y, bit=x; x>=8: byte=y+16, bit=x-8
 */
 static void decodeGnGTiles( unsigned char * dst, const unsigned char * src, int count )
 {
-    int plane_size = 0x8000;
     for( int c = 0; c < count; c++ ) {
-        int base = c * 32; // 32 bytes per tile per plane
+        int base = c * 32;
+        unsigned char * d = dst + c * 256;
         for( int y = 0; y < 16; y++ ) {
             for( int x = 0; x < 16; x++ ) {
-                int byte_offset, bit;
-                if( x < 8 ) {
-                    bit = 7 - x;
-                    byte_offset = (y < 8) ? y : (y + 8);
-                } else {
-                    bit = 7 - (x - 8);
-                    byte_offset = (y < 8) ? (y + 16) : (y + 24);
-                }
-                // Wait: the MAME layout is simpler:
-                // xoffs: 0,1,2,3,4,5,6,7, 16*8+0,...,16*8+7
-                // yoffs: 0*8,1*8,...,15*8
-                // So byte = yoffs[y]/8 + (x>=8 ? 16 : 0) = y + (x>=8?16:0)
-                // bit = 7 - (x & 7)
-                // Wait no: xoffs are bit positions within the element
-                // For x<8: xoffs[x] = x, so bit position x within a byte at row y
-                // For x>=8: xoffs[x] = 16*8 + (x-8) = 128 + (x-8)
-                // yoffs[y] = y*8
-                // Total bit position = yoffs[y] + xoffs[x]
-                // For x<8: bit_pos = y*8 + x; byte_idx = bit_pos/8 = y; bit_in_byte = x
-                // For x>=8: bit_pos = y*8 + 128 + (x-8); byte_idx = (y*8+128+(x-8))/8
-                //   = y + 16 + (x-8)/8. Since x-8 < 8, byte_idx = y + 16; bit = x - 8
-                // The bit numbering in MAME GfxLayout counts from MSB, so bit 0 = MSB.
-                // Actually in MAME the xoffs represent the bit index within the
-                // charincrement block, and bit 0 is the LSB. The actual extraction is:
-                // pixel = (data >> xoffs[x]) & 1
-                // Let me reconsider. MAME xoffs = {0,1,2,3,4,5,6,7,128,129,...,135}
-                // These are bit indices. So for each plane:
-                // For x in 0..7: bit_index = y*8 + x. byte = base + y; bit = x
-                // For x in 8..15: bit_index = y*8 + 128 + (x-8). byte = base + y + 16; bit = (x-8)
-                // Value: (src[byte] >> bit) & 1
-                // But conventional graphics have bit 7 = leftmost pixel.
-                // In MAME, xoffs={0,1,2,3,4,5,6,7} means bit 0 for x=0, bit 1 for x=1.
-                // This is reverse of typical convention. Let me just use the MAME way.
-                break; // recalculate properly below
-            }
-            break;
-        }
-        // Redo properly using MAME's exact layout
-        for( int y = 0; y < 16; y++ ) {
-            int yoff = y * 8; // bit offset for this row
-            for( int x = 0; x < 16; x++ ) {
-                int xoff = (x < 8) ? x : (128 + (x - 8));
-                int bit_index = yoff + xoff;
-                int byte_idx = bit_index / 8;
-                int bit_pos = bit_index % 8;
+                int byte_idx = (x < 8) ? y : (y + 16);
+                int bit = (x < 8) ? x : (x - 8);
 
                 int pixel = 0;
-                // Plane 0 at offset 0 (RGN_FRAC(0,3))
-                pixel |= ((src[base + byte_idx] >> bit_pos) & 1) << 0;
-                // Plane 1 at offset plane_size (RGN_FRAC(1,3))
-                pixel |= ((src[base + byte_idx + plane_size] >> bit_pos) & 1) << 1;
-                // Plane 2 at offset 2*plane_size (RGN_FRAC(2,3))
-                pixel |= ((src[base + byte_idx + 2*plane_size] >> bit_pos) & 1) << 2;
+                pixel |= ((src[base + byte_idx + 0x10000] >> bit) & 1) << 0; // plane[0] LSB
+                pixel |= ((src[base + byte_idx + 0x08000] >> bit) & 1) << 1;
+                pixel |= ((src[base + byte_idx          ] >> bit) & 1) << 2; // plane[2] MSB
 
-                dst[c * 256 + y * 16 + x] = pixel;
+                d[y * 16 + x] = pixel;
             }
         }
     }
 }
 
 /*
-    Sprites: 16x16, 4bpp
-    Layout from MAME:
-      RGN_FRAC(1,2) sprites, 4 planes: { RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0 }
-      xoffs: { 0,1,2,3, 8+0,...,8+3, 32*8+0,...,32*8+3, 33*8+0,...,33*8+3 }
-      yoffs: { 0*16,1*16,...,15*16 }
-      charincrement: 64*8 = 512 bits = 64 bytes
-    Region = 0x18000, half = 0xC000
-    Sprites = 0x18000/2 / 64 = 0xC000/64 = 49152/64 = 768... wait
-    0xC000 = 49152. 49152/64 = 768. But that seems like a lot. Let me recalculate.
-    RGN_FRAC(1,2) = region_size / 2 / (charincrement/8) = 0x18000 / 2 / 64 = 768
-    Hmm, 768 sprites is a lot but MAME uses region 0x18000 for sprites.
-    Actually wait: 6 ROMs * 0x4000 = 0x18000. First half = gg17+gg16+gg15 = 0xC000,
-    second half = gg14+gg13+gg12 = 0xC000.
-    Each sprite = 64 bytes per half. 0xC000/64 = 768. So 768 sprites total. That makes sense
-    for this game which has lots of sprite tiles.
+    Sprites: 16x16, 4bpp, 64 bytes/sprite, 768 sprites
+      planes={RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0}
+        = bit offsets {0xC000*8+4, 0xC000*8, 4, 0}
+        plane[0] LSB at bit 0, plane[1] at bit 4,
+        plane[2] at 0xC000 bytes, plane[3] MSB at 0xC000 bytes + bit 4
+      xoffs={0,1,2,3, 8,9,10,11, 256,...,259, 264,...,267}
+      yoffs={0,16,32,...,240}
+      charincrement=512 bits=64 bytes
 
-    Let me trace through the layout more carefully:
-    planes = { RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0 }
-    RGN_FRAC(1,2) = 0xC000 * 8 = 0x60000 bits
-    So plane offsets (in bits) = { 0x60004, 0x60000, 4, 0 }
-    That means planes come in pairs from each half of the region:
-    - Half 0 (0x00000-0x0BFFF): planes 0 and 1 (bits 0 and 4)
-    - Half 1 (0x0C000-0x17FFF): planes 2 and 3 (bits 0 and 4)
-
-    xoffs: { 0,1,2,3, 8,9,10,11, 256,257,258,259, 264,265,266,267 }
-    yoffs: { 0,16,32,...,240 }
-    charincrement = 512 bits = 64 bytes
-
-    For a given sprite c:
-    base_bit = c * 512
-    For pixel at (x,y):
-      bit_index = base_bit + yoffs[y] + xoffs[x]
-      For each plane p:
-        plane_offset = plane_offsets[p] (in bits)
-        total_bit = plane_offset + bit_index
-        byte = total_bit / 8
-        bit = total_bit % 8
-        pixel |= ((src[byte] >> bit) & 1) << p
+    Each sprite row = 16 bits (2 bytes). Left 8px in first 32 bytes, right 8px in next 32.
+    Within each byte pair: bits 0-3 = plane0/1 nibble, bits 4-7 = plane0/1 nibble.
 */
 static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, int count )
 {
-    int half_size = 0xC000;
     for( int c = 0; c < count; c++ ) {
-        int base = c * 64; // 64 bytes per sprite per half
+        int base = c * 64;
+        unsigned char * d = dst + c * 256;
         for( int y = 0; y < 16; y++ ) {
-            int yoff = y * 16; // bit offset within element for this row
+            int yoff = y * 16; // bit offset for this row
             for( int x = 0; x < 16; x++ ) {
                 int xoff;
                 if( x < 4 )       xoff = x;
@@ -698,49 +587,18 @@ static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, in
                 else if( x < 12 ) xoff = 256 + (x - 8);
                 else               xoff = 264 + (x - 12);
 
-                int bit_index = yoff + xoff;
-                int byte_idx = bit_index / 8;
-                int bit_pos = bit_index % 8;
+                int elem_bit = yoff + xoff;
+                int byte_idx = elem_bit / 8;
+                int bit_pos = elem_bit % 8;
 
                 int pixel = 0;
-                // Plane 0: offset 0 in bits -> byte_idx in first half
-                pixel |= ((src[base + byte_idx] >> bit_pos) & 1) << 0;
-                // Plane 1: offset 4 in bits -> same byte, bit+4
-                pixel |= ((src[base + byte_idx] >> (bit_pos + 4)) & 1) << 1;
-                // Wait, that's not right. The plane offsets are GLOBAL bit offsets added to the
-                // element's bit position. Let me reconsider.
-                //
-                // In MAME GfxLayout, each pixel is extracted as:
-                // for plane p:
-                //   global_bit = plane_offset[p] + element_start_bit + yoffs[y] + xoffs[x]
-                //   pixel |= (src[global_bit/8] >> (global_bit%8)) & 1
-                //
-                // element_start_bit = c * charincrement = c * 512
-                // plane_offsets = { half_size*8+4, half_size*8, 4, 0 }
-                //
-                // Let's compute for each plane:
-                // Plane 0 (offset=0): global_bit = c*512 + yoff + xoff
-                // Plane 1 (offset=4): global_bit = c*512 + yoff + xoff + 4
-                // Plane 2 (offset=half*8): global_bit = half_size*8 + c*512 + yoff + xoff
-                // Plane 3 (offset=half*8+4): global_bit = half_size*8 + c*512 + yoff + xoff + 4
-                //
-                // So planes 0,1 come from the first half, planes 2,3 from the second half.
-                // Within each half, plane 0 uses bit position n, plane 1 uses bit position n+4.
+                // planes 0,1 from first half; planes 2,3 from second half (+0xC000)
+                pixel |= ((src[base + byte_idx          ] >> bit_pos)       & 1) << 0;
+                pixel |= ((src[base + byte_idx          ] >> (bit_pos + 4)) & 1) << 1;
+                pixel |= ((src[base + byte_idx + 0xC000] >> bit_pos)       & 1) << 2;
+                pixel |= ((src[base + byte_idx + 0xC000] >> (bit_pos + 4)) & 1) << 3;
 
-                int elem_bit = bit_index; // relative to element start
-                // First half
-                int gb0 = base * 8 + elem_bit;       // plane 0
-                int gb1 = base * 8 + elem_bit + 4;   // plane 1
-                // Second half
-                int gb2 = half_size * 8 + base * 8 + elem_bit;       // plane 2
-                int gb3 = half_size * 8 + base * 8 + elem_bit + 4;   // plane 3
-
-                pixel  = (src[gb0/8] >> (gb0%8)) & 1;
-                pixel |= ((src[gb1/8] >> (gb1%8)) & 1) << 1;
-                pixel |= ((src[gb2/8] >> (gb2%8)) & 1) << 2;
-                pixel |= ((src[gb3/8] >> (gb3%8)) & 1) << 3;
-
-                dst[c * 256 + y * 16 + x] = pixel;
+                d[y * 16 + x] = pixel;
             }
         }
     }
@@ -748,47 +606,9 @@ static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, in
 
 void GnG::decodeGraphics()
 {
-    // Characters: 0x4000 bytes, 16 bytes per char = 256 chars
-    // Actually recalculating: region=0x4000, RGN_FRAC(1,1)=region/(charincrement/8)
-    // charincrement = 16*8 bits = 16 bytes. count = 0x4000/16 = 1024
-    // Wait: 0x4000 = 16384. 16384/16 = 1024 chars.
-    // But we declared char_data_ as 512 tiles. Let me fix: it's 1024.
-    // Actually looking at MAME: charlayout count = RGN_FRAC(1,1) = region/charincrement_bytes
-    // = 0x4000 / 16 = 1024 characters. But GnG foreground uses attr&0xc0<<2 = up to +768,
-    // so code can be 0..1023 which matches.
-    //
-    // For tiles: 0x18000/3/32 = 0x8000/32 = 1024 tiles
-    // For sprites: 0x18000/2/64 = 0xC000/64 = 768 sprites
-
-    // We need to resize our TBitBlocks to match
-    // char_data_: 8 wide, 8*1024 = 8192 tall (8 pixels per row, 1024 chars stacked)
-    // tile_data_: 16 wide, 16*1024 = 16384 tall
-    // sprite_data_: 16 wide, 16*768 = 12288 tall
-    // But we constructed them in the constructor... let me just decode into them.
-    // TBitBlock doesn't resize, so we need to construct with the right sizes.
-    // Let me check the constructor: TBitBlock(width, height). We constructed:
-    // char_data_(8, 8*512) but need 8*1024
-    // tile_data_(16, 16*512) but need 16*1024
-    // sprite_data_(16, 16*384) but need 16*768
-    // We need to fix the constructor. For now, let's just decode what fits.
-    // Actually, looking at the code pattern, GnG tile codes go up to:
-    // FG: gng_fgvideoram[idx] + ((attr & 0xc0) << 2) = 0..255 + 0/256/512/768 = 0..1023
-    // BG: same, 0..1023
-    // Sprites: buffered_spriteram[offs] + ((attributes<<2) & 0x300) = 0..255 + 0/256/512/768 = 0..1023
-    // But sprite count from layout is only 768, so actual sprite codes should be 0..767
-    // Let's just decode up to what our TBitBlock can hold and handle overflow gracefully
-
-    int numChars = 0x4000 / 16;
-    if( numChars > 512 ) numChars = 512;
-    decodeGnGChars( char_data_.data(), char_rom_, numChars );
-
-    int numTiles = 0x8000 / 32;
-    if( numTiles > 512 ) numTiles = 512;
-    decodeGnGTiles( tile_data_.data(), tile_rom_, numTiles );
-
-    int numSprites = 0xC000 / 64;
-    if( numSprites > 384 ) numSprites = 384;
-    decodeGnGSprites( sprite_data_.data(), sprite_rom_, numSprites );
+    decodeGnGChars( char_data_.data(), char_rom_, 1024 );     // 0x4000 / 16
+    decodeGnGTiles( tile_data_.data(), tile_rom_, 1024 );     // 0x8000 / 32
+    decodeGnGSprites( sprite_data_.data(), sprite_rom_, 768 ); // 0xC000 / 64
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +618,7 @@ TBitmapIndexed * GnG::renderVideo()
 {
     // Update palette
     for( int i = 0; i < 0x100; i++ ) {
-        decodePalette( palette(), main_board_.paletteram_1_, main_board_.paletteram_2_, i );
+        decodePalette( palette(), main_board_.paletteram_2_, main_board_.paletteram_1_, i );
     }
 
     // Clear screen
@@ -823,7 +643,7 @@ TBitmapIndexed * GnG::renderVideo()
             int flipx = (attr >> 4) & 1;
             int flipy = (attr >> 5) & 1;
 
-            if( code >= 512 ) continue; // outside our decoded range
+            if( code >= 1024 ) continue;
 
             int sx = tx * 16 - bgScrollX;
             int sy = ty * 16 - bgScrollY;
@@ -863,7 +683,7 @@ TBitmapIndexed * GnG::renderVideo()
         int code = main_board_.buffered_spriteram_[offs] + ((attributes << 2) & 0x300);
         int color = (attributes >> 4) & 3;
 
-        if( code >= 384 ) continue;
+        if( code >= 768 ) continue;
 
         if( main_board_.flipscreen_ ) {
             sx = 240 - sx;
@@ -897,7 +717,7 @@ TBitmapIndexed * GnG::renderVideo()
             int flipx = (attr >> 4) & 1;
             int flipy = (attr >> 5) & 1;
 
-            if( code >= 512 ) continue;
+            if( code >= 1024 ) continue;
 
             int sx = tx * 8;
             int sy = ty * 8 - ScreenVisibleOffsetY;
