@@ -265,9 +265,12 @@ unsigned char GnGMainBoard::readByte( unsigned addr )
     if( addr == 0x3C00 )
         return 0; // watchdog
 
-    // Banked ROM: 0x4000-0x5FFF (gg5.bin pages at 0x10000)
+    // Banked ROM: 0x4000-0x5FFF
+    // bank 0 = gg4.bin at rom_[0x4000]; banks 1-4 = gg5.bin at rom_[0x10000 + bank*0x2000]
     if( addr >= 0x4000 && addr < 0x6000 ) {
-        return rom_[0x10000 + (bankselect_ & 3) * 0x2000 + (addr - 0x4000)];
+        if( bankselect_ == 0 )
+            return rom_[addr]; // gg4.bin
+        return rom_[0x10000 + bankselect_ * 0x2000 + (addr - 0x4000)];
     }
 
     // Fixed ROM: 0x6000-0xFFFF (mapped at offset 0x6000 in rom_ since ROM is loaded at 0x8000)
@@ -486,6 +489,9 @@ void GnG::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingRate )
     if( refresh_roms_ ) {
         decodeGraphics();
         refresh_roms_ = false;
+        // M6809 reads reset vector from ROM, must reset after ROMs are loaded
+        main_board_.reset();
+        sound_board_.reset();
     }
 
     main_board_.run();
@@ -517,15 +523,15 @@ static void decodeGnGChars( unsigned char * dst, const unsigned char * src, int 
             unsigned char b0 = s[y * 2];
             unsigned char b1 = s[y * 2 + 1];
             // xoffs 0..3 from b0, xoffs 8..11 from b1
-            // plane[0]=offset 4 (LSB), plane[1]=offset 0 (MSB)
+            // plane[0]=offset 4 → MSB (bit 1), plane[1]=offset 0 → LSB (bit 0)
             for( int x = 0; x < 4; x++ ) {
-                int p0 = (b0 >> (x + 4)) & 1;
-                int p1 = (b0 >> x) & 1;
+                int p1 = (b0 >> (x + 4)) & 1; // plane[0] → bit 1 (MSB)
+                int p0 = (b0 >> x) & 1;        // plane[1] → bit 0 (LSB)
                 d[y * 8 + x] = p0 | (p1 << 1);
             }
             for( int x = 0; x < 4; x++ ) {
-                int p0 = (b1 >> (x + 4)) & 1;
-                int p1 = (b1 >> x) & 1;
+                int p1 = (b1 >> (x + 4)) & 1; // plane[0] → bit 1 (MSB)
+                int p0 = (b1 >> x) & 1;        // plane[1] → bit 0 (LSB)
                 d[y * 8 + 4 + x] = p0 | (p1 << 1);
             }
         }
@@ -550,9 +556,9 @@ static void decodeGnGTiles( unsigned char * dst, const unsigned char * src, int 
                 int bit = (x < 8) ? x : (x - 8);
 
                 int pixel = 0;
-                pixel |= ((src[base + byte_idx + 0x10000] >> bit) & 1) << 0; // plane[0] LSB
+                pixel |= ((src[base + byte_idx          ] >> bit) & 1) << 0; // plane[2] LSB
                 pixel |= ((src[base + byte_idx + 0x08000] >> bit) & 1) << 1;
-                pixel |= ((src[base + byte_idx          ] >> bit) & 1) << 2; // plane[2] MSB
+                pixel |= ((src[base + byte_idx + 0x10000] >> bit) & 1) << 2; // plane[0] MSB
 
                 d[y * 16 + x] = pixel;
             }
@@ -575,28 +581,29 @@ static void decodeGnGTiles( unsigned char * dst, const unsigned char * src, int 
 */
 static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, int count )
 {
+    // MAME GfxLayout: 16x16, 4bpp, charincrement=64 bytes
+    // planes = { RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0 }
+    // xoffs  = { 0,1,2,3, 8,9,10,11, 256,257,258,259, 264,265,266,267 }
+    // yoffs  = { 0,16,32,...,112, 256,272,288,...,368 }
+    static const int xoffs[16] = { 0,1,2,3, 8,9,10,11, 256,257,258,259, 264,265,266,267 };
+    static const int yoffs[16] = { 0,16,32,48,64,80,96,112, 256,272,288,304,320,336,352,368 };
+
     for( int c = 0; c < count; c++ ) {
-        int base = c * 64;
+        int charbase = c * 512; // charincrement=512 bits
         unsigned char * d = dst + c * 256;
         for( int y = 0; y < 16; y++ ) {
-            int yoff = y * 16; // bit offset for this row
             for( int x = 0; x < 16; x++ ) {
-                int xoff;
-                if( x < 4 )       xoff = x;
-                else if( x < 8 )  xoff = 8 + (x - 4);
-                else if( x < 12 ) xoff = 256 + (x - 8);
-                else               xoff = 264 + (x - 12);
-
-                int elem_bit = yoff + xoff;
-                int byte_idx = elem_bit / 8;
-                int bit_pos = elem_bit % 8;
+                int bitpos = charbase + yoffs[y] + xoffs[x];
+                int byte0 = bitpos / 8;
+                int bit0  = bitpos % 8;
 
                 int pixel = 0;
-                // planes 0,1 from first half; planes 2,3 from second half (+0xC000)
-                pixel |= ((src[base + byte_idx          ] >> bit_pos)       & 1) << 0;
-                pixel |= ((src[base + byte_idx          ] >> (bit_pos + 4)) & 1) << 1;
-                pixel |= ((src[base + byte_idx + 0xC000] >> bit_pos)       & 1) << 2;
-                pixel |= ((src[base + byte_idx + 0xC000] >> (bit_pos + 4)) & 1) << 3;
+                // plane[3]=bit 0 (LSB), plane[2]=bit 4, both in first half
+                pixel |= ((src[byte0] >> bit0) & 1) << 0;
+                pixel |= ((src[byte0] >> (bit0 + 4)) & 1) << 1;
+                // plane[1]=bit 0, plane[0]=bit 4, both in second half (+0xC000)
+                pixel |= ((src[byte0 + 0xC000] >> bit0) & 1) << 2;
+                pixel |= ((src[byte0 + 0xC000] >> (bit0 + 4)) & 1) << 3;
 
                 d[y * 16 + x] = pixel;
             }

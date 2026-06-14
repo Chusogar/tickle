@@ -347,8 +347,10 @@ void M6809::do_firq()
 
 void M6809::irq()
 {
+    // SYNC: any interrupt signal clears SYNC, even if masked
+    int_state_ &= ~StateSYNC;
+
     if( !(CC & FlagI) ) {
-        int_state_ &= ~StateSYNC;
         do_irq();
     }
     irq_state_ = 0;
@@ -356,8 +358,9 @@ void M6809::irq()
 
 void M6809::firq()
 {
+    int_state_ &= ~StateSYNC;
+
     if( !(CC & FlagF) ) {
-        int_state_ &= ~StateSYNC;
         do_firq();
     }
     firq_state_ = 0;
