@@ -75,6 +75,7 @@ public:
 
     unsigned getCycles() const { return cycles_; }
     void setCycles( unsigned c ) { cycles_ = c; }
+    unsigned char getIntState() const { return int_state_; }
 
 private:
     M6809Environment & env_;

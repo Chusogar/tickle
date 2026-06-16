@@ -204,6 +204,7 @@ void GnGMainBoard::reset()
     flipscreen_ = 0;
     memset( bgscrollx_, 0, sizeof(bgscrollx_) );
     memset( bgscrolly_, 0, sizeof(bgscrolly_) );
+
 }
 
 void GnGMainBoard::run()
@@ -266,11 +267,14 @@ unsigned char GnGMainBoard::readByte( unsigned addr )
         return 0; // watchdog
 
     // Banked ROM: 0x4000-0x5FFF
-    // bank 0 = gg4.bin at rom_[0x4000]; banks 1-4 = gg5.bin at rom_[0x10000 + bank*0x2000]
+    // Banks 0-3 → gg5.bin pages (rom_[0x10000 + bank*0x2000])
+    // Bank 4   → gg4.bin first half (rom_[0x4000])
     if( addr >= 0x4000 && addr < 0x6000 ) {
-        if( bankselect_ == 0 )
-            return rom_[addr]; // gg4.bin
-        return rom_[0x10000 + bankselect_ * 0x2000 + (addr - 0x4000)];
+        unsigned bank = bankselect_ & 7;
+        if( bank < 4 )
+            return rom_[0x10000 + bank * 0x2000 + (addr - 0x4000)];
+        else
+            return rom_[0x4000 + (addr - 0x4000)]; // gg4.bin
     }
 
     // Fixed ROM: 0x6000-0xFFFF (mapped at offset 0x6000 in rom_ since ROM is loaded at 0x8000)
@@ -343,6 +347,7 @@ void GnGMainBoard::writeByte( unsigned addr, unsigned char value )
             bankselect_ = value;
             return;
     }
+
 }
 
 // ---------------------------------------------------------------------------
