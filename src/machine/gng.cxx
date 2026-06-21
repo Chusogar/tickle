@@ -9,6 +9,7 @@
     Sound: 2x YM2203 (SSG portion emulated via YM2149)
 */
 #include "gng.h"
+#include <stdio.h>
 
 enum {
     ScreenWidth             = 256,
@@ -209,8 +210,9 @@ void GnGMainBoard::reset()
 
 void GnGMainBoard::run()
 {
-    cpu_->run( MainCpuCyclesPerFrame );
+    // Fire VBLANK IRQ at start of frame (like MAME's irq0_line_hold at VBLANK)
     cpu_->irq();
+    cpu_->run( MainCpuCyclesPerFrame );
 
     // Buffer spriteram at end of frame (MAME: gng_eof_callback)
     memcpy( buffered_spriteram_, spriteram_, sizeof(spriteram_) );
@@ -263,18 +265,23 @@ unsigned char GnGMainBoard::readByte( unsigned addr )
         case 0x3004: return dsw1_;
     }
 
+    // Palette RAM is readable (some games verify writes)
+    if( addr >= 0x3800 && addr < 0x3900 )
+        return paletteram_2_[addr - 0x3800];
+    if( addr >= 0x3900 && addr < 0x3A00 )
+        return paletteram_1_[addr - 0x3900];
+
     if( addr == 0x3C00 )
         return 0; // watchdog
 
     // Banked ROM: 0x4000-0x5FFF
-    // Banks 0-3 → gg5.bin pages (rom_[0x10000 + bank*0x2000])
-    // Bank 4   → gg4.bin first half (rom_[0x4000])
+    // Banks 0-3 → gg5.bin pages, bank 4 → gg4.bin first half
     if( addr >= 0x4000 && addr < 0x6000 ) {
         unsigned bank = bankselect_ & 7;
         if( bank < 4 )
             return rom_[0x10000 + bank * 0x2000 + (addr - 0x4000)];
         else
-            return rom_[0x4000 + (addr - 0x4000)]; // gg4.bin
+            return rom_[0x4000 + (addr - 0x4000)];
     }
 
     // Fixed ROM: 0x6000-0xFFFF (mapped at offset 0x6000 in rom_ since ROM is loaded at 0x8000)
@@ -502,6 +509,7 @@ void GnG::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingRate )
     main_board_.run();
     sound_board_.playSound( frame->getMixer(), samplesPerFrame, samplingRate );
     frame->setVideo( renderVideo() );
+
 }
 
 // ---------------------------------------------------------------------------
@@ -527,16 +535,15 @@ static void decodeGnGChars( unsigned char * dst, const unsigned char * src, int 
         for( int y = 0; y < 8; y++ ) {
             unsigned char b0 = s[y * 2];
             unsigned char b1 = s[y * 2 + 1];
-            // xoffs 0..3 from b0, xoffs 8..11 from b1
-            // plane[0]=offset 4 → MSB (bit 1), plane[1]=offset 0 → LSB (bit 0)
+            // MSB-first: bit 0 of xoffs = MSB of byte
             for( int x = 0; x < 4; x++ ) {
-                int p1 = (b0 >> (x + 4)) & 1; // plane[0] → bit 1 (MSB)
-                int p0 = (b0 >> x) & 1;        // plane[1] → bit 0 (LSB)
+                int p1 = (b0 >> (7 - x)) & 1; // plane[0] (MSB of pixel)
+                int p0 = (b0 >> (3 - x)) & 1; // plane[1] (LSB of pixel)
                 d[y * 8 + x] = p0 | (p1 << 1);
             }
             for( int x = 0; x < 4; x++ ) {
-                int p1 = (b1 >> (x + 4)) & 1; // plane[0] → bit 1 (MSB)
-                int p0 = (b1 >> x) & 1;        // plane[1] → bit 0 (LSB)
+                int p1 = (b1 >> (7 - x)) & 1;
+                int p0 = (b1 >> (3 - x)) & 1;
                 d[y * 8 + 4 + x] = p0 | (p1 << 1);
             }
         }
@@ -560,10 +567,11 @@ static void decodeGnGTiles( unsigned char * dst, const unsigned char * src, int 
                 int byte_idx = (x < 8) ? y : (y + 16);
                 int bit = (x < 8) ? x : (x - 8);
 
+                int rbit = 7 - bit; // MSB-first
                 int pixel = 0;
-                pixel |= ((src[base + byte_idx          ] >> bit) & 1) << 0; // plane[2] LSB
-                pixel |= ((src[base + byte_idx + 0x08000] >> bit) & 1) << 1;
-                pixel |= ((src[base + byte_idx + 0x10000] >> bit) & 1) << 2; // plane[0] MSB
+                pixel |= ((src[base + byte_idx          ] >> rbit) & 1) << 0;
+                pixel |= ((src[base + byte_idx + 0x08000] >> rbit) & 1) << 1;
+                pixel |= ((src[base + byte_idx + 0x10000] >> rbit) & 1) << 2;
 
                 d[y * 16 + x] = pixel;
             }
@@ -575,8 +583,8 @@ static void decodeGnGTiles( unsigned char * dst, const unsigned char * src, int 
     Sprites: 16x16, 4bpp, 64 bytes/sprite, 768 sprites
       planes={RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0}
         = bit offsets {0xC000*8+4, 0xC000*8, 4, 0}
-        plane[0] LSB at bit 0, plane[1] at bit 4,
-        plane[2] at 0xC000 bytes, plane[3] MSB at 0xC000 bytes + bit 4
+        plane[0] MSB at 0xC000+bit4, plane[1] at 0xC000+bit0,
+        plane[2] at bit4, plane[3] LSB at bit0
       xoffs={0,1,2,3, 8,9,10,11, 256,...,259, 264,...,267}
       yoffs={0,16,32,...,240}
       charincrement=512 bits=64 bytes
@@ -589,9 +597,9 @@ static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, in
     // MAME GfxLayout: 16x16, 4bpp, charincrement=64 bytes
     // planes = { RGN_FRAC(1,2)+4, RGN_FRAC(1,2)+0, 4, 0 }
     // xoffs  = { 0,1,2,3, 8,9,10,11, 256,257,258,259, 264,265,266,267 }
-    // yoffs  = { 0,16,32,...,112, 256,272,288,...,368 }
+    // yoffs  = { 0,16,32,...,240 }
     static const int xoffs[16] = { 0,1,2,3, 8,9,10,11, 256,257,258,259, 264,265,266,267 };
-    static const int yoffs[16] = { 0,16,32,48,64,80,96,112, 256,272,288,304,320,336,352,368 };
+    static const int yoffs[16] = { 0,16,32,48,64,80,96,112, 128,144,160,176,192,208,224,240 };
 
     for( int c = 0; c < count; c++ ) {
         int charbase = c * 512; // charincrement=512 bits
@@ -602,13 +610,12 @@ static void decodeGnGSprites( unsigned char * dst, const unsigned char * src, in
                 int byte0 = bitpos / 8;
                 int bit0  = bitpos % 8;
 
+                int rbit0 = 7 - bit0; // MSB-first
                 int pixel = 0;
-                // plane[3]=bit 0 (LSB), plane[2]=bit 4, both in first half
-                pixel |= ((src[byte0] >> bit0) & 1) << 0;
-                pixel |= ((src[byte0] >> (bit0 + 4)) & 1) << 1;
-                // plane[1]=bit 0, plane[0]=bit 4, both in second half (+0xC000)
-                pixel |= ((src[byte0 + 0xC000] >> bit0) & 1) << 2;
-                pixel |= ((src[byte0 + 0xC000] >> (bit0 + 4)) & 1) << 3;
+                pixel |= ((src[byte0] >> rbit0) & 1) << 0;
+                pixel |= ((src[byte0] >> (rbit0 - 4)) & 1) << 1;
+                pixel |= ((src[byte0 + 0xC000] >> rbit0) & 1) << 2;
+                pixel |= ((src[byte0 + 0xC000] >> (rbit0 - 4)) & 1) << 3;
 
                 d[y * 16 + x] = pixel;
             }

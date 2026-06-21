@@ -191,7 +191,8 @@ void M6809::indexed()
                 icount_ -= 1;
                 break;
             case 0x08: // n8,R
-                ea_ = (regval + SIGNED8(imm8())) & 0xFFFF;
+                { unsigned char t = imm8();
+                  ea_ = (regval + SIGNED8(t)) & 0xFFFF; }
                 icount_ -= 1;
                 break;
             case 0x09: // n16,R
@@ -236,7 +237,8 @@ void M6809::indexed()
                 icount_ -= 4;
                 break;
             case 0x18: // [n8,R]
-                ea_ = rm16((regval + SIGNED8(imm8())) & 0xFFFF);
+                { unsigned char t = imm8();
+                  ea_ = rm16((regval + SIGNED8(t)) & 0xFFFF); }
                 icount_ -= 4;
                 break;
             case 0x19: // [n16,R]
@@ -280,6 +282,7 @@ void M6809::indexed()
         case 0x40: U = regval; break;
         case 0x60: S = regval; break;
     }
+
 }
 
 // ---------------------------------------------------------------------------
