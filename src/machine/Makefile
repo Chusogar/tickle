@@ -18,11 +18,19 @@ PLAIN_OBJECTS = \
 	vanguard.o \
 	vanguard_soundboard.o \
 	spectrum.o \
+	elevatob.o \
+	gng.o \
+	mrdo.o \
+	phoenix.o \
+	tehkanwc.o \
+	shaolins.o \
+	minivadr.o \
+	gauntlet.o \
 	z80_ay3_soundboard.o
 
 OBJECTS = $(addprefix $(OBJDIR),$(PLAIN_OBJECTS))
 
-$(OBJDIR)%.o : %.cxx
+$(OBJDIR)%.o : %.cpp
 	$(CC) $(CC_FLAGS) -I./.. -c $< -o $@
 
 DRIVERLIB = $(OBJDIR)../machine.a

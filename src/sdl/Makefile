@@ -12,7 +12,7 @@ LIBS = $(OBJDIR)../machine.a $(OBJDIR)../cpu.a $(OBJDIR)../emu.a $(OBJDIR)../sou
 
 CC_FLAGS += $(SDL_CFLAGS) -I..
 
-$(OBJDIR)%.o : %.cxx
+$(OBJDIR)%.o : %.cpp
 	$(CC) $(CC_FLAGS) -c $< -o $@
 
 TICKLE = $(OBJDIR)../tickle

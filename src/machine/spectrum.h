@@ -28,6 +28,8 @@ enum {
 
 // -----------------------------------------------------------------------------
 // Encoding helpers used by main.c.
+// The low bit is reserved for press/release state because TEmuInputManager
+// forwards data|param where param is 0 or 1.
 // -----------------------------------------------------------------------------
 #define ZX48K_KEY_DATA(row,bit) \
     ((((unsigned)(row) & 0x0F) << 8) | (((unsigned)(bit) & 0x0F) << 4))
@@ -38,6 +40,9 @@ enum {
      (((unsigned)(row2) & 0x0F) << 16) | \
      (((unsigned)(bit2) & 0x0F) << 12))
 
+// -----------------------------------------------------------------------------
+// Small wrapper exposing interrupt mode setter from the Z80 core.
+// -----------------------------------------------------------------------------
 class ZX48kCpu : public Z80
 {
 public:
@@ -49,6 +54,9 @@ public:
     }
 };
 
+// -----------------------------------------------------------------------------
+// Main machine board: memory map, ULA I/O, keyboard matrix, tape and beeper.
+// -----------------------------------------------------------------------------
 struct ZX48kBoard : public Z80Environment
 {
     ZX48kBoard();
@@ -75,15 +83,12 @@ struct ZX48kBoard : public Z80Environment
     bool loadSna48k( const unsigned char * buf, unsigned len );
     bool loadTap( const unsigned char * buf, unsigned len );
 
-    // TAP playback through EAR (hybrid:
-    // real EAR state + exact ROM LD-BYTES handoff)
+    // TAP playback through EAR only
     void stopTapPlayback();
-    bool startNextTapBlock();
     bool armTapPlayback();
     bool rewindAndPlayTap();
+    bool startNextTapBlock();
     void advanceTap( unsigned cycles );
-    bool parseNextTapBlock( const unsigned char ** blk, unsigned * block_len );
-    bool handleTapTrap();
 
     enum TTapeState {
         TapeIdle,
@@ -118,6 +123,17 @@ struct ZX48kBoard : public Z80Environment
     unsigned      beeper_event_cycle_[MaxBeeperEvents];
     unsigned char beeper_event_level_[MaxBeeperEvents];
 
+    // Border event log for scanline rendering
+    enum {
+        MaxBorderEvents = 1024
+    };
+
+    unsigned      border_event_count_;
+    unsigned      border_event_cycle_[MaxBorderEvents];
+    unsigned char border_event_color_[MaxBorderEvents];
+
+    void logBorderChange( unsigned cycle, unsigned char color );
+
     // Tape image
     unsigned char * tap_data_;
     unsigned tap_size_;
@@ -138,6 +154,9 @@ struct ZX48kBoard : public Z80Environment
     ZX48kCpu * cpu_;
 };
 
+// -----------------------------------------------------------------------------
+// Tickle machine wrapper
+// -----------------------------------------------------------------------------
 class ZX48k : public TStandardMachine
 {
 public:
@@ -160,6 +179,11 @@ protected:
 
     static unsigned short pixelAddress( int x, int y );
     static unsigned short attrAddress( int x, int y );
+
+    // Scanline render helpers
+    void renderScanline( TBitBlock * bits, int y_out, bool flash_phase );
+    unsigned char borderColorForOutputScanline( int y_out ) const;
+    static int hardwareLineForOutputLine( int y_out );
 
 private:
     ZX48k( const ZX48k & );

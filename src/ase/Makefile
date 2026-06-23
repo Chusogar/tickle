@@ -17,7 +17,7 @@ PLAIN_OBJECTS = \
 
 OBJECTS = $(addprefix $(OBJDIR),$(PLAIN_OBJECTS))
 
-$(OBJDIR)%.o : %.cxx
+$(OBJDIR)%.o : %.cpp
 	$(CC) $(CC_FLAGS) -c $< -o $@
 
 ASELIB = $(OBJDIR)../ase.a
