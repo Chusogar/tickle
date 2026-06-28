@@ -14,7 +14,7 @@
 enum {
     ScreenWidth             = 336,
     ScreenHeight            = 240,
-    ScreenColors            = 1024,
+    ScreenColors            = 256,
     VideoFrequency          = 60,
     MainCpuClock            = 7000000,      // 14MHz / 2
     SoundCpuClock           = 1750000,      // 14MHz / 8
@@ -836,37 +836,38 @@ void Gauntlet::decodeGraphics()
 // Video rendering
 // ===========================================================================
 
-static void decodePaletteEntry( TPalette * palette, const unsigned char * ram, int index )
+static unsigned decodeHWColor( const unsigned char * ram, int hwIndex )
 {
-    // Gauntlet palette: IIIIRRRRGGGGBBBB (16-bit)
-    unsigned char hi = ram[index * 2];     // IIIIRRRR
-    unsigned char lo = ram[index * 2 + 1]; // GGGGBBBB
+    unsigned char hi = ram[hwIndex * 2];     // IIIIRRRR
+    unsigned char lo = ram[hwIndex * 2 + 1]; // GGGGBBBB
 
     int intensity = (hi >> 4) & 0x0F;
     int r = hi & 0x0F;
     int g = (lo >> 4) & 0x0F;
     int b = lo & 0x0F;
 
-    // Apply intensity: color = (color * (intensity + 1)) / 16
-    // This maps intensity 15 → full brightness, intensity 0 → very dark
     r = (r * (intensity + 1)) >> 4;
     g = (g * (intensity + 1)) >> 4;
     b = (b * (intensity + 1)) >> 4;
 
-    // Expand 4-bit to 8-bit
     r = (r << 4) | r;
     g = (g << 4) | g;
     b = (b << 4) | b;
 
-    palette->setColor( index, TPalette::encodeColor(r, g, b) );
+    return TPalette::encodeColor(r, g, b);
 }
 
 TBitmapIndexed * Gauntlet::renderVideo()
 {
-    // Update palette (1024 entries)
-    for( int i = 0; i < 1024; i++ ) {
-        decodePaletteEntry( palette(), main_board_.palette_, i );
-    }
+    // Build 256-entry palette from hardware's 1024-entry palette RAM:
+    //   Indices   0-127: PF  (hw 0x200-0x27F: 8 palette groups × 16 colors)
+    //   Indices 128-255: Alpha (hw 0x000-0x07F: 32 palette groups × 4 colors)
+    // MO shares PF range (0-127) or renders pixel-by-pixel for extra groups.
+    palette()->setColor( 0, TPalette::encodeColor(0, 0, 0) );
+    for( int i = 0; i < 128; i++ )
+        palette()->setColor( i, decodeHWColor(main_board_.palette_, 0x200 + i) );
+    for( int i = 0; i < 128; i++ )
+        palette()->setColor( 128 + i, decodeHWColor(main_board_.palette_, i) );
 
     // Clear screen
     screen()->bits()->fill( 0 );
@@ -898,10 +899,6 @@ TBitmapIndexed * Gauntlet::renderVideo()
             code = ((tileBankSelect * 0x1000) + code) ^ 0x800;
             if( code < 0 || code >= 8192 ) continue;
 
-            // Color: base 0x200 (playfield palette at 910400-9105FF)
-            // 0x10 + colorbank*8 + pal_sel where colorbank = 1 (non-vindctr2)
-            int color = 0x10 + 1 * 8 + pal_sel;
-
             int sx = col * 8 - pfScrollX;
             int sy = row * 8 - pfScrollY;
 
@@ -916,7 +913,8 @@ TBitmapIndexed * Gauntlet::renderVideo()
             unsigned op = 0;
             if( hflip ) op |= opFlipX;
 
-            unsigned char colorBase = (unsigned char)(color * 16);
+            // PF palette: indices 0-127, colorBase = pal_sel * 16
+            unsigned char colorBase = (unsigned char)(pal_sel * 16);
             TBltAddSrcZeroTrans blitter(0);
             screen()->bits()->copy( sx, sy, pfmo_data_, 0, 8 * code, 8, 8, op, blitter.color(colorBase) );
         }
@@ -978,10 +976,8 @@ TBitmapIndexed * Gauntlet::renderVideo()
             xpos = ((xpos % 512) + 512) % 512;
             ypos = ((ypos % 512) + 512) % 512;
 
-            // Color base: MO palette at 0x100 (910200-9103FF)
-            int color = 0x10 + pal;
-
-            // Render all tiles in the sprite
+            // Render all tiles in the sprite pixel-by-pixel
+            // MO palette at hw 0x100 + pal * 16
             for( int ty = 0; ty < height; ty++ ) {
                 for( int tx = 0; tx < width; tx++ ) {
                     int tile = code + ty + tx * 8;
@@ -993,12 +989,20 @@ TBitmapIndexed * Gauntlet::renderVideo()
                     if( dx >= ScreenWidth || dy >= ScreenHeight ) continue;
                     if( dx + 8 <= 0 || dy + 8 <= 0 ) continue;
 
-                    unsigned op = 0;
-                    if( hflip ) op |= opFlipX;
-
-                    unsigned char colorBase = (unsigned char)(color * 16);
-                    TBltAddSrcTrans blitter( 0, 0 );
-                    screen()->bits()->copy( dx, dy, pfmo_data_, 0, 8 * tile, 8, 8, op, blitter.color(colorBase) );
+                    for( int py = 0; py < 8; py++ ) {
+                        int sy = dy + py;
+                        if( sy < 0 || sy >= ScreenHeight ) continue;
+                        for( int px = 0; px < 8; px++ ) {
+                            int sx = dx + (hflip ? (7 - px) : px);
+                            if( sx < 0 || sx >= ScreenWidth ) continue;
+                            unsigned char pix = pfmo_data_.pixel( px, tile * 8 + py );
+                            if( pix == 0 ) continue;
+                            int hwColor = 0x100 + pal * 16 + pix;
+                            unsigned rgb = decodeHWColor(main_board_.palette_, hwColor);
+                            int nearest = palette()->getNearestColor( rgb );
+                            screen()->bits()->setPixel( sx, sy, nearest );
+                        }
+                    }
                 }
             }
 
@@ -1035,8 +1039,8 @@ TBitmapIndexed * Gauntlet::renderVideo()
 
             if( sx >= ScreenWidth || sy >= ScreenHeight ) continue;
 
-            // Alpha palette at 0x000 (910000-9101FF)
-            unsigned char colorBase = (unsigned char)(pal * 4);
+            // Alpha palette at indices 128-255 (hw 0x000-0x07F)
+            unsigned char colorBase = (unsigned char)(128 + (pal & 0x1F) * 4);
 
             if( opaque ) {
                 TBltAddSrcZeroTrans blitter(0);
