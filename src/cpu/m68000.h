@@ -62,6 +62,9 @@ public:
     unsigned SR;            // Status register (CCR + system byte)
     unsigned USP;           // User stack pointer
     unsigned SSP;           // Supervisor stack pointer
+    unsigned VBR;           // Vector Base Register (M68010)
+    unsigned SFC;           // Source Function Code (M68010)
+    unsigned DFC;           // Destination Function Code (M68010)
 
     M68000( M68000Environment & env );
     virtual ~M68000() {}
@@ -117,6 +120,11 @@ private:
     unsigned readEA( int mode, int reg, int size );
     // Write to EA
     void writeEA( int mode, int reg, int size, unsigned val );
+
+    // Read-modify-write EA helpers: compute EA once, avoiding double fetch/increment
+    unsigned readEA_rmw( int mode, int reg, int size );
+    void writeEA_rmw( int mode, int reg, int size, unsigned val );
+    unsigned rmwEA_;    // cached EA for read-modify-write
 
     // Condition code helpers
     void setFlagNZ_B( unsigned val );

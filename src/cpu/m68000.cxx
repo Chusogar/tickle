@@ -5,7 +5,6 @@
     Implements the base M68000 instruction set.
 */
 #include "m68000.h"
-
 #define SIGN8(x)  ((int)(signed char)(x))
 #define SIGN16(x) ((int)(short)(x))
 
@@ -18,6 +17,7 @@ M68000::M68000( M68000Environment & env ) : env_(env)
     halted_ = false;
     for( int i = 0; i < 8; i++ ) { D[i] = 0; A[i] = 0; }
     PC = 0; SR = 0x2700; USP = 0; SSP = 0;
+    rmwEA_ = 0;
 }
 
 void M68000::setSR( unsigned val )
@@ -42,6 +42,9 @@ void M68000::setSR( unsigned val )
 void M68000::reset()
 {
     SR = 0x2700;  // Supervisor mode, all interrupts masked
+    VBR = 0;
+    SFC = 0;
+    DFC = 0;
     SSP = env_.readLong( 0 );
     A[7] = SSP;
     PC  = env_.readLong( 4 );
@@ -202,6 +205,24 @@ void M68000::writeEA( int mode, int reg, int size, unsigned val )
             else wm32( ea, val );
         }
     }
+}
+
+// Read-modify-write EA: compute EA once for the read, cache it for the write
+unsigned M68000::readEA_rmw( int mode, int reg, int size )
+{
+    if( mode <= 1 ) return readEA( mode, reg, size );
+    rmwEA_ = computeEA( mode, reg, size );
+    if( size == 1 ) return rm8( rmwEA_ );
+    if( size == 2 ) return rm16( rmwEA_ );
+    return rm32( rmwEA_ );
+}
+
+void M68000::writeEA_rmw( int mode, int reg, int size, unsigned val )
+{
+    if( mode <= 1 ) { writeEA( mode, reg, size, val ); return; }
+    if( size == 1 ) wm8( rmwEA_, val );
+    else if( size == 2 ) wm16( rmwEA_, val );
+    else wm32( rmwEA_, val );
 }
 
 // ---- Flag helpers ----
@@ -509,9 +530,11 @@ void M68000::exception( int vector )
 {
     unsigned oldSR = SR;
     setSR( (SR | FlagS) & ~FlagT );  // Enter supervisor, clear trace
+    // M68010 format: push format/vector offset word after PC
+    pushWord( (unsigned short)(vector * 4) );  // Format 0 + vector offset
     pushLong( PC );
     pushWord( oldSR );
-    PC = rm32( vector * 4 );
+    PC = rm32( VBR + vector * 4 );
     icount_ -= 34;
 }
 
@@ -519,13 +542,35 @@ void M68000::groupZeroException( int vector, unsigned addr, unsigned status )
 {
     unsigned oldSR = SR;
     setSR( (SR | FlagS) & ~FlagT );
-    // Group 0 pushes extra info
-    pushWord( 0 );      // Function code
-    pushLong( addr );    // Access address
-    pushWord( 0 );       // Instruction register
-    pushWord( oldSR );
+    // M68010 bus/address error frame (format 8)
+    // Push additional words for long frame
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Internal info
+    pushWord( 0 );       // Special status word
+    pushWord( (unsigned short)(0x8000 | (vector * 4)) );  // Format 8 + vector offset
     pushLong( PC );
-    PC = rm32( vector * 4 );
+    pushWord( oldSR );
+    PC = rm32( VBR + vector * 4 );
     icount_ -= 50;
 }
 
@@ -537,10 +582,12 @@ void M68000::checkInterrupts()
             int vector = env_.interruptAcknowledge( irq_level_ );
             unsigned oldSR = SR;
             setSR( (SR & ~(MaskIPM|FlagT)) | FlagS | (irq_level_ << 8) );
+            if( vector < 0 ) vector = 24 + irq_level_;  // autovector
+            // M68010 format: push format/vector offset word
+            pushWord( (unsigned short)(vector * 4) );  // Format 0 + vector offset
             pushLong( PC );
             pushWord( oldSR );
-            if( vector < 0 ) vector = 24 + irq_level_;  // autovector
-            PC = rm32( vector * 4 );
+            PC = rm32( VBR + vector * 4 );
             stopped_ = false;
             icount_ -= 44;
         }
@@ -746,56 +793,56 @@ void M68000::group0000( unsigned op )
     switch( subop ) {
         case 0: // ORI
         {
-            unsigned val = readEA(dstMode, dstReg, size);
+            unsigned val = readEA_rmw(dstMode, dstReg, size);
             unsigned r = val | imm;
             if( size == 1 ) setFlagNZ_B(r);
             else if( size == 2 ) setFlagNZ_W(r);
             else setFlagNZ_L(r);
-            writeEA(dstMode, dstReg, size, r);
+            writeEA_rmw(dstMode, dstReg, size, r);
             icount_ -= (dstMode == 0) ? ((size == 4) ? 16 : 8) : ((size == 4) ? 20 : 12);
             break;
         }
         case 1: // ANDI
         {
-            unsigned val = readEA(dstMode, dstReg, size);
+            unsigned val = readEA_rmw(dstMode, dstReg, size);
             unsigned r = val & imm;
             if( size == 1 ) setFlagNZ_B(r);
             else if( size == 2 ) setFlagNZ_W(r);
             else setFlagNZ_L(r);
-            writeEA(dstMode, dstReg, size, r);
+            writeEA_rmw(dstMode, dstReg, size, r);
             icount_ -= (dstMode == 0) ? ((size == 4) ? 16 : 8) : ((size == 4) ? 20 : 12);
             break;
         }
         case 2: // SUBI
         {
-            unsigned val = readEA(dstMode, dstReg, size);
+            unsigned val = readEA_rmw(dstMode, dstReg, size);
             unsigned r;
             if( size == 1 ) r = sub_b(imm, val);
             else if( size == 2 ) r = sub_w(imm, val);
             else r = sub_l(imm, val);
-            writeEA(dstMode, dstReg, size, r);
+            writeEA_rmw(dstMode, dstReg, size, r);
             icount_ -= (dstMode == 0) ? ((size == 4) ? 16 : 8) : ((size == 4) ? 20 : 12);
             break;
         }
         case 3: // ADDI
         {
-            unsigned val = readEA(dstMode, dstReg, size);
+            unsigned val = readEA_rmw(dstMode, dstReg, size);
             unsigned r;
             if( size == 1 ) r = add_b(imm, val);
             else if( size == 2 ) r = add_w(imm, val);
             else r = add_l(imm, val);
-            writeEA(dstMode, dstReg, size, r);
+            writeEA_rmw(dstMode, dstReg, size, r);
             icount_ -= (dstMode == 0) ? ((size == 4) ? 16 : 8) : ((size == 4) ? 20 : 12);
             break;
         }
         case 5: // EORI
         {
-            unsigned val = readEA(dstMode, dstReg, size);
+            unsigned val = readEA_rmw(dstMode, dstReg, size);
             unsigned r = val ^ imm;
             if( size == 1 ) setFlagNZ_B(r);
             else if( size == 2 ) setFlagNZ_W(r);
             else setFlagNZ_L(r);
-            writeEA(dstMode, dstReg, size, r);
+            writeEA_rmw(dstMode, dstReg, size, r);
             icount_ -= (dstMode == 0) ? ((size == 4) ? 16 : 8) : ((size == 4) ? 20 : 12);
             break;
         }
@@ -882,25 +929,25 @@ void M68000::group0100( unsigned op )
     switch( (op >> 6) & 0x3F ) {
         case 0x00: // NEGX.B
         {
-            unsigned val = readEA(mode, reg, 1);
+            unsigned val = readEA_rmw(mode, reg, 1);
             unsigned r = negx_b(val);
-            writeEA(mode, reg, 1, r);
+            writeEA_rmw(mode, reg, 1, r);
             icount_ -= (mode == 0) ? 4 : 8;
             return;
         }
         case 0x01: // NEGX.W
         {
-            unsigned val = readEA(mode, reg, 2);
+            unsigned val = readEA_rmw(mode, reg, 2);
             unsigned r = negx_w(val);
-            writeEA(mode, reg, 2, r);
+            writeEA_rmw(mode, reg, 2, r);
             icount_ -= (mode == 0) ? 4 : 8;
             return;
         }
         case 0x02: // NEGX.L
         {
-            unsigned val = readEA(mode, reg, 4);
+            unsigned val = readEA_rmw(mode, reg, 4);
             unsigned r = negx_l(val);
-            writeEA(mode, reg, 4, r);
+            writeEA_rmw(mode, reg, 4, r);
             icount_ -= (mode == 0) ? 6 : 12;
             return;
         }
@@ -912,8 +959,8 @@ void M68000::group0100( unsigned op )
         }
         case 0x08: // CLR.B
         {
-            readEA(mode, reg, 1); // read before write (bus cycle)
-            writeEA(mode, reg, 1, 0);
+            readEA_rmw(mode, reg, 1); // read before write (bus cycle)
+            writeEA_rmw(mode, reg, 1, 0);
             SR &= ~(FlagN|FlagV|FlagC);
             SR |= FlagZ;
             icount_ -= (mode == 0) ? 4 : 8;
@@ -921,8 +968,8 @@ void M68000::group0100( unsigned op )
         }
         case 0x09: // CLR.W
         {
-            readEA(mode, reg, 2);
-            writeEA(mode, reg, 2, 0);
+            readEA_rmw(mode, reg, 2);
+            writeEA_rmw(mode, reg, 2, 0);
             SR &= ~(FlagN|FlagV|FlagC);
             SR |= FlagZ;
             icount_ -= (mode == 0) ? 4 : 8;
@@ -930,77 +977,83 @@ void M68000::group0100( unsigned op )
         }
         case 0x0A: // CLR.L
         {
-            readEA(mode, reg, 4);
-            writeEA(mode, reg, 4, 0);
+            readEA_rmw(mode, reg, 4);
+            writeEA_rmw(mode, reg, 4, 0);
             SR &= ~(FlagN|FlagV|FlagC);
             SR |= FlagZ;
             icount_ -= (mode == 0) ? 6 : 12;
             return;
         }
-        case 0x0B: // MOVE to CCR
+        case 0x0B: // MOVE from CCR (M68010+) / undefined on M68000
+        {
+            writeEA(mode, reg, 2, getCCR());
+            icount_ -= (mode == 0) ? 6 : 8;
+            return;
+        }
+        case 0x10: // NEG.B
+        {
+            unsigned val = readEA_rmw(mode, reg, 1);
+            unsigned r = neg_b(val);
+            writeEA_rmw(mode, reg, 1, r);
+            icount_ -= (mode == 0) ? 4 : 8;
+            return;
+        }
+        case 0x11: // NEG.W
+        {
+            unsigned val = readEA_rmw(mode, reg, 2);
+            unsigned r = neg_w(val);
+            writeEA_rmw(mode, reg, 2, r);
+            icount_ -= (mode == 0) ? 4 : 8;
+            return;
+        }
+        case 0x12: // NEG.L
+        {
+            unsigned val = readEA_rmw(mode, reg, 4);
+            unsigned r = neg_l(val);
+            writeEA_rmw(mode, reg, 4, r);
+            icount_ -= (mode == 0) ? 6 : 12;
+            return;
+        }
+        case 0x13: // MOVE to CCR
         {
             unsigned val = readEA(mode, reg, 2);
             setCCR(val);
             icount_ -= 12;
             return;
         }
-        case 0x10: // NEG.B
-        {
-            unsigned val = readEA(mode, reg, 1);
-            unsigned r = neg_b(val);
-            writeEA(mode, reg, 1, r);
-            icount_ -= (mode == 0) ? 4 : 8;
-            return;
-        }
-        case 0x11: // NEG.W
-        {
-            unsigned val = readEA(mode, reg, 2);
-            unsigned r = neg_w(val);
-            writeEA(mode, reg, 2, r);
-            icount_ -= (mode == 0) ? 4 : 8;
-            return;
-        }
-        case 0x12: // NEG.L
-        {
-            unsigned val = readEA(mode, reg, 4);
-            unsigned r = neg_l(val);
-            writeEA(mode, reg, 4, r);
-            icount_ -= (mode == 0) ? 6 : 12;
-            return;
-        }
-        case 0x13: // MOVE to SR (supervisor)
-        {
-            if( !isSupervisor() ) { exception(8); return; }
-            unsigned val = readEA(mode, reg, 2);
-            setSR(val);
-            icount_ -= 12;
-            return;
-        }
         case 0x18: // NOT.B
         {
-            unsigned val = readEA(mode, reg, 1);
+            unsigned val = readEA_rmw(mode, reg, 1);
             unsigned r = (~val) & 0xFF;
             setFlagNZ_B(r);
-            writeEA(mode, reg, 1, r);
+            writeEA_rmw(mode, reg, 1, r);
             icount_ -= (mode == 0) ? 4 : 8;
             return;
         }
         case 0x19: // NOT.W
         {
-            unsigned val = readEA(mode, reg, 2);
+            unsigned val = readEA_rmw(mode, reg, 2);
             unsigned r = (~val) & 0xFFFF;
             setFlagNZ_W(r);
-            writeEA(mode, reg, 2, r);
+            writeEA_rmw(mode, reg, 2, r);
             icount_ -= (mode == 0) ? 4 : 8;
             return;
         }
         case 0x1A: // NOT.L
         {
-            unsigned val = readEA(mode, reg, 4);
+            unsigned val = readEA_rmw(mode, reg, 4);
             unsigned r = ~val;
             setFlagNZ_L(r);
-            writeEA(mode, reg, 4, r);
+            writeEA_rmw(mode, reg, 4, r);
             icount_ -= (mode == 0) ? 6 : 12;
+            return;
+        }
+        case 0x1B: // MOVE to SR (supervisor)
+        {
+            if( !isSupervisor() ) { exception(8); return; }
+            unsigned val = readEA(mode, reg, 2);
+            setSR(val);
+            icount_ -= 12;
             return;
         }
         case 0x20: // NBCD
@@ -1193,23 +1246,6 @@ void M68000::group0100( unsigned op )
     // More misc group 4 instructions
     int hi = (op >> 8) & 0xF;
 
-    if( hi == 0xE ) {
-        // JSR or JMP
-        if( op & 0x0040 ) {
-            // JMP <ea>
-            unsigned ea = computeEA(mode, reg, 4);
-            PC = ea;
-            icount_ -= 8;
-        } else {
-            // JSR <ea>
-            unsigned ea = computeEA(mode, reg, 4);
-            pushLong(PC);
-            PC = ea;
-            icount_ -= 16;
-        }
-        return;
-    }
-
     if( (op & 0xFFF0) == 0x4E70 ) {
         switch( op & 0xF ) {
             case 0: // RESET
@@ -1232,6 +1268,13 @@ void M68000::group0100( unsigned op )
                 if( isSupervisor() ) {
                     unsigned newSR = popWord();
                     PC = popLong();
+                    unsigned formatWord = popWord();
+                    int format = (formatWord >> 12) & 0xF;
+                    // Handle M68010 extended frames
+                    if( format == 8 ) {
+                        // Long bus/address error frame: skip 23 additional words
+                        A[7] += 46;
+                    }
                     setSR(newSR);
                     icount_ -= 20;
                 } else {
@@ -1252,6 +1295,36 @@ void M68000::group0100( unsigned op )
                 PC = popLong();
                 setCCR(newCCR);
                 icount_ -= 20;
+                return;
+            }
+            case 0xA: // MOVEC Rc,Rn (read control register)
+            case 0xB: // MOVEC Rn,Rc (write control register)
+            {
+                if( !isSupervisor() ) { exception(8); return; }
+                unsigned ext = fetch16();
+                int rn = (ext >> 12) & 0xF;
+                unsigned * gpr = (rn & 8) ? &A[rn & 7] : &D[rn & 7];
+                int rc = ext & 0xFFF;
+                if( (op & 1) == 0 ) {
+                    // MOVEC Rc,Rn (read)
+                    switch( rc ) {
+                        case 0x000: *gpr = SFC; break;
+                        case 0x001: *gpr = DFC; break;
+                        case 0x800: *gpr = USP; break;
+                        case 0x801: *gpr = VBR; break;
+                        default: *gpr = 0; break;
+                    }
+                } else {
+                    // MOVEC Rn,Rc (write)
+                    switch( rc ) {
+                        case 0x000: SFC = *gpr & 7; break;
+                        case 0x001: DFC = *gpr & 7; break;
+                        case 0x800: USP = *gpr; break;
+                        case 0x801: VBR = *gpr; break;
+                        default: break;
+                    }
+                }
+                icount_ -= 12;
                 return;
             }
         }
@@ -1319,6 +1392,23 @@ void M68000::group0100( unsigned op )
         return;
     }
 
+    // JSR (0x4E80-0x4EBF)
+    if( (op & 0xFFC0) == 0x4E80 ) {
+        unsigned ea = computeEA(mode, reg, 4);
+        pushLong(PC);
+        PC = ea;
+        icount_ -= 16;
+        return;
+    }
+
+    // JMP (0x4EC0-0x4EFF)
+    if( (op & 0xFFC0) == 0x4EC0 ) {
+        unsigned ea = computeEA(mode, reg, 4);
+        PC = ea;
+        icount_ -= 8;
+        return;
+    }
+
     exception(4); // Illegal instruction
 }
 
@@ -1373,12 +1463,12 @@ void M68000::group0101( unsigned op )
             A[reg] -= data3;
             icount_ -= 8;
         } else {
-            unsigned val = readEA(mode, reg, size);
+            unsigned val = readEA_rmw(mode, reg, size);
             unsigned r;
             if( size == 1 ) r = sub_b(data3, val);
             else if( size == 2 ) r = sub_w(data3, val);
             else r = sub_l(data3, val);
-            writeEA(mode, reg, size, r);
+            writeEA_rmw(mode, reg, size, r);
             icount_ -= (mode == 0) ? ((size == 4) ? 8 : 4) : ((size == 4) ? 12 : 8);
         }
     } else {
@@ -1387,12 +1477,12 @@ void M68000::group0101( unsigned op )
             A[reg] += data3;
             icount_ -= 8;
         } else {
-            unsigned val = readEA(mode, reg, size);
+            unsigned val = readEA_rmw(mode, reg, size);
             unsigned r;
             if( size == 1 ) r = add_b(data3, val);
             else if( size == 2 ) r = add_w(data3, val);
             else r = add_l(data3, val);
-            writeEA(mode, reg, size, r);
+            writeEA_rmw(mode, reg, size, r);
             icount_ -= (mode == 0) ? ((size == 4) ? 8 : 4) : ((size == 4) ? 12 : 8);
         }
     }
@@ -1726,10 +1816,10 @@ void M68000::group1011( unsigned op )
                 cmp_b(s, d);
                 icount_ -= 12;
             } else {
-                unsigned d = readEA(mode, reg, 1);
+                unsigned d = readEA_rmw(mode, reg, 1);
                 unsigned r = (D[dstReg] & 0xFF) ^ d;
                 setFlagNZ_B(r);
-                writeEA(mode, reg, 1, r);
+                writeEA_rmw(mode, reg, 1, r);
                 icount_ -= (mode == 0) ? 4 : 8;
             }
             break;
@@ -1742,10 +1832,10 @@ void M68000::group1011( unsigned op )
                 cmp_w(s, d);
                 icount_ -= 12;
             } else {
-                unsigned d = readEA(mode, reg, 2);
+                unsigned d = readEA_rmw(mode, reg, 2);
                 unsigned r = (D[dstReg] & 0xFFFF) ^ d;
                 setFlagNZ_W(r);
-                writeEA(mode, reg, 2, r);
+                writeEA_rmw(mode, reg, 2, r);
                 icount_ -= (mode == 0) ? 4 : 8;
             }
             break;
@@ -1758,10 +1848,10 @@ void M68000::group1011( unsigned op )
                 cmp_l(s, d);
                 icount_ -= 20;
             } else {
-                unsigned d = readEA(mode, reg, 4);
+                unsigned d = readEA_rmw(mode, reg, 4);
                 unsigned r = D[dstReg] ^ d;
                 setFlagNZ_L(r);
-                writeEA(mode, reg, 4, r);
+                writeEA_rmw(mode, reg, 4, r);
                 icount_ -= (mode == 0) ? 8 : 12;
             }
             break;

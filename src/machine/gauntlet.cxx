@@ -10,7 +10,6 @@
     Video: 336x240, 1024 colors (IIIIRRRRGGGGBBBB)
 */
 #include "gauntlet.h"
-#include <stdio.h>
 
 enum {
     ScreenWidth             = 336,
@@ -262,6 +261,12 @@ void GauntletMainBoard::reset()
 
 void GauntletMainBoard::run()
 {
+    // VBLANK period: ~10% of frame (typical for 262 line display, ~16 VBLANK lines)
+    unsigned vblank_cycles = MainCpuCyclesPerFrame / 10;
+
+    // Set VBLANK active (bit 6 = 0)
+    port_status_ &= ~0x40;
+
     // Fire VBLANK IRQ (IRQ4)
     vblank_irq_ = true;
     int level = 0;
@@ -269,7 +274,15 @@ void GauntletMainBoard::run()
     if( sound_irq_ ) level = 6;
     cpu_->setIRQLine( level );
 
-    cpu_->run( MainCpuCyclesPerFrame );
+    // Run CPU during VBLANK period
+    unsigned overflow = cpu_->run( vblank_cycles );
+
+    // Set VBLANK inactive (bit 6 = 1)
+    port_status_ |= 0x40;
+
+    // Run CPU for rest of frame
+    unsigned remaining = MainCpuCyclesPerFrame - vblank_cycles + overflow;
+    cpu_->run( remaining );
 }
 
 /*
@@ -333,11 +346,10 @@ unsigned char GauntletMainBoard::readByte( unsigned addr )
     if( addr >= 0x038000 && addr < 0x040000 ) {
         unsigned offset = (addr - 0x038000) >> 1;
         slapstic_tweak( offset );
-        unsigned bank_base = 0x038000 + slapstic_bank_ * 0x2000;
         unsigned local = addr - 0x038000;
         if( local >= 0x2000 )
             return rom_[0x038000 + local]; // Non-banked part
-        return rom_[bank_base + local];
+        return rom_[0x038000 + slapstic_bank_ * 0x2000 + local];
     }
 
     // Program ROM (040000-07FFFF)
@@ -493,6 +505,7 @@ void GauntletMainBoard::writeByte( unsigned addr, unsigned char value )
     if( (addr & 0xF00000) == 0x900000 ) {
         unsigned local = addr & 0x3FFFF;
 
+        // Playfield (900000-901FFF)
         if( local < 0x2000 ) {
             playfield_[local] = value;
             return;
@@ -563,7 +576,7 @@ void GauntletMainBoard::writeWord( unsigned addr, unsigned value )
 
 Gauntlet::Gauntlet() :
     main_board_( &sound_board_ ),
-    alpha_data_( 8, 8 * 512 ),
+    alpha_data_( 8, 8 * 1024 ),
     pfmo_data_( 8, 8 * 8192 )
 {
     createScreen( ScreenWidth, ScreenHeight, ScreenColors );
@@ -592,30 +605,29 @@ Gauntlet::Gauntlet() :
 bool Gauntlet::initialize( TMachineDriverInfo * info )
 {
     // Main CPU ROMs - loaded as interleaved even/odd bytes
-    // These are loaded into temporary buffers, then interleaved in setResourceFile
     resourceHandler()->add( Rom9A,  "136037-1307.9a",  0x8000, efROM, 0 );
     resourceHandler()->add( Rom9B,  "136037-1308.9b",  0x8000, efROM, 0 );
-    resourceHandler()->add( Rom10A, "136037-205.10a",   0x4000, efROM, 0 );
-    resourceHandler()->add( Rom10B, "136037-206.10b",   0x4000, efROM, 0 );
+    resourceHandler()->add( Rom10A, "136037-205.10a",  0x4000, efROM, 0 );
+    resourceHandler()->add( Rom10B, "136037-206.10b",  0x4000, efROM, 0 );
     resourceHandler()->add( Rom7A,  "136037-1409.7a",  0x8000, efROM, 0 );
     resourceHandler()->add( Rom7B,  "136037-1410.7b",  0x8000, efROM, 0 );
 
     // Sound CPU ROMs
-    resourceHandler()->add( Rom16R, "136037-120.16r", 0x4000, efROM, 0 );
-    resourceHandler()->add( Rom16S, "136037-119.16s", 0x8000, efROM, 0 );
+    resourceHandler()->add( Rom16R, "136037-120.16r",  0x4000, efROM, 0 );
+    resourceHandler()->add( Rom16S, "136037-119.16s",  0x8000, efROM, 0 );
 
     // GFX1 - alphanumerics
-    resourceHandler()->add( Rom6P, "136037-104.6p", 0x2000, efVideoROM, alpha_rom_ );
+    resourceHandler()->add( Rom6P,  "136037-104.6p",   0x4000, efVideoROM, alpha_rom_ );
 
     // GFX2 - playfield/motion objects (8 ROMs, inverted)
-    resourceHandler()->add( Rom1A,  "136037-111.1a",  0x8000, efVideoROM, pfmo_rom_ + 0x00000 );
-    resourceHandler()->add( Rom1B,  "136037-112.1b",  0x8000, efVideoROM, pfmo_rom_ + 0x08000 );
-    resourceHandler()->add( Rom1L,  "136037-113.1l",  0x8000, efVideoROM, pfmo_rom_ + 0x10000 );
-    resourceHandler()->add( Rom1MN, "136037-114.1mn", 0x8000, efVideoROM, pfmo_rom_ + 0x18000 );
-    resourceHandler()->add( Rom2A,  "136037-115.2a",  0x8000, efVideoROM, pfmo_rom_ + 0x20000 );
-    resourceHandler()->add( Rom2B,  "136037-116.2b",  0x8000, efVideoROM, pfmo_rom_ + 0x28000 );
-    resourceHandler()->add( Rom2L,  "136037-117.2l",  0x8000, efVideoROM, pfmo_rom_ + 0x30000 );
-    resourceHandler()->add( Rom2MN, "136037-118.2mn", 0x8000, efVideoROM, pfmo_rom_ + 0x38000 );
+    resourceHandler()->add( Rom1A,  "136037-111.1a",   0x8000, efVideoROM, pfmo_rom_ + 0x00000 );
+    resourceHandler()->add( Rom1B,  "136037-112.1b",   0x8000, efVideoROM, pfmo_rom_ + 0x08000 );
+    resourceHandler()->add( Rom1L,  "136037-113.1l",   0x8000, efVideoROM, pfmo_rom_ + 0x10000 );
+    resourceHandler()->add( Rom1MN, "136037-114.1mn",  0x8000, efVideoROM, pfmo_rom_ + 0x18000 );
+    resourceHandler()->add( Rom2A,  "136037-115.2a",   0x8000, efVideoROM, pfmo_rom_ + 0x20000 );
+    resourceHandler()->add( Rom2B,  "136037-116.2b",   0x8000, efVideoROM, pfmo_rom_ + 0x28000 );
+    resourceHandler()->add( Rom2L,  "136037-117.2l",   0x8000, efVideoROM, pfmo_rom_ + 0x30000 );
+    resourceHandler()->add( Rom2MN, "136037-118.2mn",  0x8000, efVideoROM, pfmo_rom_ + 0x38000 );
 
     resourceHandler()->assignToMachineDriverInfo( info );
 
@@ -690,14 +702,14 @@ void Gauntlet::reset()
 void Gauntlet::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingRate )
 {
     if( refresh_roms_ ) {
-        // Swap ROM halves (as MAME does in gauntlet_common_init)
-        // Swap 0x000000-0x007FFF with 0x008000-0x00FFFF
+        // Swap the two halves of each 68000 ROM pair so vectors are at address 0
+        // 9a/9b: swap 0x00000-0x07FFF with 0x08000-0x0FFFF
         for( unsigned i = 0; i < 0x8000; i++ ) {
             unsigned char tmp = main_board_.rom_[i];
             main_board_.rom_[i] = main_board_.rom_[0x8000 + i];
             main_board_.rom_[0x8000 + i] = tmp;
         }
-        // Swap 0x040000-0x047FFF with 0x048000-0x04FFFF
+        // 7a/7b: swap 0x40000-0x47FFF with 0x48000-0x4FFFF
         for( unsigned i = 0; i < 0x8000; i++ ) {
             unsigned char tmp = main_board_.rom_[0x40000 + i];
             main_board_.rom_[0x40000 + i] = main_board_.rom_[0x48000 + i];
@@ -715,15 +727,9 @@ void Gauntlet::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingR
         sound_board_.reset();
     }
 
-    // Set VBLANK active (bit 6 = 0, active low)
-    main_board_.port_status_ &= ~0x40;
-
     main_board_.run();
     sound_board_.playSound( frame->getMixer(), samplesPerFrame, samplingRate );
     frame->setVideo( renderVideo() );
-
-    // Clear VBLANK (bit 6 = 1, inactive)
-    main_board_.port_status_ |= 0x40;
 
     frame_counter_++;
 }
@@ -814,8 +820,8 @@ static void decodePFMOTiles( unsigned char * dst, const unsigned char * src, int
 
 void Gauntlet::decodeGraphics()
 {
-    // Alpha: 0x2000 bytes / 16 bytes per tile = 512 tiles
-    int alpha_count = 0x2000 / 16;  // 512 tiles
+    // Alpha: 0x4000 bytes / 16 bytes per tile = 1024 tiles
+    int alpha_count = 0x4000 / 16;  // 1024 tiles
     decodeAlphaTiles( alpha_data_.data(), alpha_rom_, alpha_count );
 
     // PF/MO: 0x40000 bytes total, 4 planes of 0x10000 bytes each
@@ -1022,7 +1028,7 @@ TBitmapIndexed * Gauntlet::renderVideo()
             int code = data & 0x3FF;
 
             if( code == 0 && !opaque ) continue;
-            if( code >= 512 ) continue;
+            if( code >= 1024 ) continue;
 
             int sx = col * 8;
             int sy = row * 8;

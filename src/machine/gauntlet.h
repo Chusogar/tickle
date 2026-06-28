@@ -129,7 +129,7 @@ private:
     unsigned char pfmo_rom_[0x40000];       // GFX2: playfield/motion objects
 
     // Decoded graphics
-    TBitBlock alpha_data_;    // 512 tiles, 8x8, 2bpp
+    TBitBlock alpha_data_;    // 1024 tiles, 8x8, 2bpp
     TBitBlock pfmo_data_;     // 8192 tiles, 8x8, 4bpp
 
     // VBLANK state
