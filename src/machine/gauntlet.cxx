@@ -1059,7 +1059,10 @@ TBitmapIndexed * Gauntlet::renderVideo()
 
                 for( int ty = 0; ty < height; ty++ ) {
                     for( int tx = 0; tx < width; tx++ ) {
-                        int tile = code + ty + tx * 8;
+                        // Tiles are laid out row-major with a stride equal to
+                        // the object width (code + row*width + col), matching
+                        // MAME's Gauntlet motion-object drawing.
+                        int tile = code + ty * width + tx;
                         if( tile < 0 || tile >= 8192 ) continue;
 
                         int dx = sxbase + (hflip ? (width - 1 - tx) : tx) * 8;
