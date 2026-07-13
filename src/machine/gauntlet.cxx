@@ -25,9 +25,9 @@ enum {
 // ROM file IDs
 enum {
     // Main CPU ROMs (interleaved even/odd bytes)
-    Rom9A, Rom9B,       // 0x000000, 0x8000 each
-    Rom10A, Rom10B,     // 0x038000, 0x4000 each (slapstic)
-    Rom7A, Rom7B,       // 0x040000, 0x8000 each
+    Rom9A, Rom9B,       // 0x000000, 0x8000 each (32K, halves swapped)
+    Rom10A, Rom10B,     // 0x038000, 0x4000 each (slapstic area)
+    Rom7A, Rom7B,       // 0x040000, 0x8000 each (32K, halves swapped)
     // Sound CPU ROMs
     Rom16R, Rom16S,
     // GFX1 - alphanumerics
@@ -59,6 +59,7 @@ enum {
 GauntletSoundBoard::GauntletSoundBoard()
 {
     cpu_ = new N6502( *this );
+    main_board_ = 0;
     sound_cmd_ = 0;
     sound_resp_ = 0;
     cmd_pending_ = false;
@@ -79,6 +80,12 @@ GauntletSoundBoard::~GauntletSoundBoard()
 void GauntletSoundBoard::reset()
 {
     cpu_->reset();
+    // Skip the hardware-readiness spin-wait at reset vector ($599E).
+    // The boot code loops at $59A5 waiting for ($1030 & 0xC0)==0x80 which
+    // checks a hardware status line not present in emulation.
+    // Jump directly to the initialization entry at $4002 which sets up
+    // the sound CPU (IRQs, mixer, coin handling).
+    cpu_->PC = 0x4002;
     sound_cmd_ = 0;
     sound_resp_ = 0;
     cmd_pending_ = false;
@@ -113,17 +120,26 @@ unsigned char GauntletSoundBoard::readByte( unsigned addr )
         return sound_cmd_;
     }
 
-    // Coin inputs (0x1020)
-    if( addr >= 0x1020 && addr < 0x1030 )
-        return coin_inputs_;
+    // Coin inputs + status (0x1020)
+    // Bits 0-3: coin switches (active low)
+    // Bit 4: sound_to_cpu_ready (resp_pending)
+    // Bit 5: cpu_to_sound_ready (cmd_pending)
+    if( addr >= 0x1020 && addr < 0x1030 ) {
+        unsigned char val = coin_inputs_ & 0x0F;
+        if( resp_pending_ ) val |= 0x10;
+        if( cmd_pending_ ) val |= 0x20;
+        return val;
+    }
 
-    // Sound status read (0x1030)
+    // Sound status / IRQ acknowledge read (0x1030)
+    // Bit 7: cpu_to_sound_ready (command pending from main CPU)
+    // Bit 6: sound_to_cpu_ready (response pending, not yet read by main CPU)
     if( addr >= 0x1030 && addr < 0x1040 ) {
-        unsigned char temp = 0x30;
-        if( cmd_pending_ ) temp ^= 0x80;
-        if( resp_pending_ ) temp ^= 0x40;
-        temp ^= 0x20; // TMS5220 always ready
-        return temp;
+        irq_state_ = false;
+        unsigned char status = 0;
+        if( cmd_pending_ ) status |= 0x80;
+        if( resp_pending_ ) status |= 0x40;
+        return status;
     }
 
     // POKEY (0x1800-0x180F) - stub
@@ -161,6 +177,12 @@ void GauntletSoundBoard::writeByte( unsigned addr, unsigned char value )
     if( addr >= 0x1000 && addr < 0x1010 ) {
         sound_resp_ = value;
         resp_pending_ = true;
+        // Trigger IRQ level 6 on main CPU (sound-to-CPU response ready)
+        if( main_board_ ) {
+            main_board_->sound_irq_ = true;
+            int level = 6;
+            main_board_->cpu_->setIRQLine( level );
+        }
         return;
     }
 
@@ -225,7 +247,8 @@ void GauntletSoundBoard::playSound( TMixer * mixer, unsigned len, unsigned sampl
 GauntletMainBoard::GauntletMainBoard( GauntletSoundBoard * sb )
     : cpu_( new M68000(*this) ), sound_board_( sb )
 {
-    memset( rom_, 0xFF, sizeof(rom_) );
+    sb->main_board_ = this;
+    memset( rom_, 0, sizeof(rom_) );
     memset( ram_, 0, sizeof(ram_) );
     memset( eeprom_, 0xFF, sizeof(eeprom_) );
     eeprom_enabled_ = false;
@@ -239,7 +262,7 @@ GauntletMainBoard::GauntletMainBoard( GauntletSoundBoard * sb )
     slapstic_bank_ = 3;
     slapstic_state_ = SLAP_DISABLED;
     memset( port_in_, 0xFF, sizeof(port_in_) );
-    port_status_ = 0x48;   // VBLANK inactive (bit6=1), self-test off (bit3=1, active low)
+    port_status_ = 0x08;   // VBLANK inactive (bit6=0, active high), self-test off (bit3=1, active low)
     vblank_irq_ = false;
     sound_irq_ = false;
 }
@@ -261,28 +284,53 @@ void GauntletMainBoard::reset()
 
 void GauntletMainBoard::run()
 {
-    // VBLANK period: ~10% of frame (typical for 262 line display, ~16 VBLANK lines)
-    unsigned vblank_cycles = MainCpuCyclesPerFrame / 10;
+    // Interleave main CPU and sound CPU in small time slices for proper
+    // communication timing. Each scanline is split into multiple sub-slices
+    // so the sound CPU can respond before the main CPU polls for a response.
+    const int numLines = 262;
+    const int slicesPerLine = 8;
+    const int totalSlices = numLines * slicesPerLine;
+    unsigned mainPerSlice = MainCpuCyclesPerFrame / totalSlices;
+    unsigned sndPerSlice  = SoundCpuCyclesPerFrame / totalSlices;
+    int vblankStart = 240;
 
-    // Set VBLANK active (bit 6 = 0)
-    port_status_ &= ~0x40;
+    for( int slice = 0; slice < totalSlices; slice++ ) {
+        int line = slice / slicesPerLine;
+        int subslice = slice % slicesPerLine;
 
-    // Fire VBLANK IRQ (IRQ4)
-    vblank_irq_ = true;
-    int level = 0;
-    if( vblank_irq_ ) level = 4;
-    if( sound_irq_ ) level = 6;
-    cpu_->setIRQLine( level );
+        // VBLANK handling at the start of the scanline
+        if( subslice == 0 ) {
+            if( line == vblankStart ) {
+                port_status_ |= 0x40;  // VBLANK active (bit6=1, active high)
+                vblank_irq_ = true;
+                int level = 4;
+                if( sound_irq_ ) level = 6;
+                cpu_->setIRQLine( level );
+            }
+            if( line == 0 ) {
+                port_status_ &= ~0x40; // VBLANK inactive
+            }
+        }
 
-    // Run CPU during VBLANK period
-    unsigned overflow = cpu_->run( vblank_cycles );
+        // Run main CPU for this slice
+        cpu_->run( mainPerSlice );
 
-    // Set VBLANK inactive (bit 6 = 1)
-    port_status_ |= 0x40;
-
-    // Run CPU for rest of frame
-    unsigned remaining = MainCpuCyclesPerFrame - vblank_cycles + overflow;
-    cpu_->run( remaining );
+        // Run sound CPU for this slice
+        if( !sound_board_->sound_cpu_reset_ ) {
+            sound_board_->cpu_->run( sndPerSlice );
+            // Sound IRQ on 32V (every 32 scanlines)
+            if( subslice == 0 ) {
+                if( line & 32 ) {
+                    if( !sound_board_->irq_state_ ) {
+                        sound_board_->irq_state_ = true;
+                        sound_board_->cpu_->interrupt( N6502::Int_IRQ );
+                    }
+                } else {
+                    sound_board_->irq_state_ = false;
+                }
+            }
+        }
+    }
 }
 
 /*
@@ -339,8 +387,11 @@ unsigned char GauntletMainBoard::readByte( unsigned addr )
     addr &= 0xFFFFFF;
 
     // Program ROM (000000-037FFF)
-    if( addr < 0x038000 )
-        return rom_[addr];
+    // 9a/9b: 32K words, only A1-A15 decoded → 64KB unique, mirrored
+    // After swap: $000000=second half (vectors+boot), $008000=first half (code)
+    if( addr < 0x038000 ) {
+        return rom_[addr & 0xFFFF];
+    }
 
     // Slapstic ROM (038000-03FFFF)
     if( addr >= 0x038000 && addr < 0x040000 ) {
@@ -353,8 +404,9 @@ unsigned char GauntletMainBoard::readByte( unsigned addr )
     }
 
     // Program ROM (040000-07FFFF)
-    if( addr >= 0x040000 && addr < 0x080000 )
+    if( addr >= 0x040000 && addr < 0x080000 ) {
         return rom_[addr];
+    }
 
     // Program RAM (800000-801FFF, mirrored)
     if( (addr & 0xF00000) == 0x800000 ) {
@@ -457,6 +509,7 @@ void GauntletMainBoard::writeByte( unsigned addr, unsigned char value )
                 if( local & 1 ) {
                     bool old_reset = sound_board_->sound_cpu_reset_;
                     sound_board_->sound_cpu_reset_ = !(value & 1);
+
                     if( old_reset && !sound_board_->sound_cpu_reset_ ) {
                         sound_board_->reset();
                     }
@@ -481,13 +534,9 @@ void GauntletMainBoard::writeByte( unsigned addr, unsigned char value )
                 if( local & 1 ) {
                     sound_board_->sound_cmd_ = value;
                     sound_board_->cmd_pending_ = true;
-                    // Trigger NMI on sound CPU
+                    // Trigger NMI on sound CPU (command ready)
                     if( !sound_board_->sound_cpu_reset_ )
                         sound_board_->cpu_->interrupt( N6502::Int_NMI );
-                    // Set sound IRQ on main CPU
-                    sound_irq_ = true;
-                    int level = 6;
-                    cpu_->setIRQLine( level );
                 }
                 return;
             }
@@ -582,7 +631,6 @@ Gauntlet::Gauntlet() :
     createScreen( ScreenWidth, ScreenHeight, ScreenColors );
 
     refresh_roms_ = true;
-    frame_counter_ = 0;
 
     // Player 1 joystick + buttons (port_in_[0])
     // Bits: UP=0x80, DOWN=0x40, LEFT=0x20, RIGHT=0x10, B2/START=0x01, B1=0x02
@@ -651,7 +699,7 @@ bool Gauntlet::setResourceFile( int id, const unsigned char * buf, unsigned len 
             refresh_roms_ = true;
             return true;
         case Rom10A:
-            // Even bytes at 0x038000
+            // Even bytes at 0x038000 (slapstic area)
             for( unsigned i = 0; i < len && i < 0x4000; i++ )
                 main_board_.rom_[0x038000 + i * 2] = buf[i];
             refresh_roms_ = true;
@@ -702,8 +750,7 @@ void Gauntlet::reset()
 void Gauntlet::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingRate )
 {
     if( refresh_roms_ ) {
-        // Swap the two halves of each 68000 ROM pair so vectors are at address 0
-        // 9a/9b: swap 0x00000-0x07FFF with 0x08000-0x0FFFF
+        // Swap 9a/9b halves: put vectors+boot at $000000, game code at $008000
         for( unsigned i = 0; i < 0x8000; i++ ) {
             unsigned char tmp = main_board_.rom_[i];
             main_board_.rom_[i] = main_board_.rom_[0x8000 + i];
@@ -719,19 +766,44 @@ void Gauntlet::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingR
         decodeGraphics();
         refresh_roms_ = false;
 
-        // Initialize default EEPROM data
-        // Default EEPROM: fill with 0xFF (game will initialize on first boot)
-        memset( main_board_.eeprom_, 0xFF, sizeof(main_board_.eeprom_) );
+        // Initialize EEPROM with MAME default data (coins/credits/settings)
+        {
+            static const unsigned short gauntlet_default_eeprom[] = {
+                0x0001,0x01FF,0x0F00,0x011A,0x014A,0x0100,0x01A1,0x0200,
+                0x010E,0x01FF,0x0300,0x01FF,0x0400,0x01FF,0x0500,0x01FF,
+                0x0600,0x01FF,0x0700,0x01FF,0x0800,0x01FF,0x0900,0x01FF,
+                0x0A00,0x01FF,0x0B00,0x01FF,0x0C00,0x01FF,0x0D00,0x01FF,
+                0x0E00,0x01FF,0x0F00,0x01FF,0x1000,0x01FF,0x1100,0x01FF,
+                0x1200,0x01FF,0x1300,0x01FF,0x1400,0x01FF,0x1500,0x01FF,
+                0x1600,0x01FF,0x1700,0x01FF,0x1800,0x01FF,0x1900,0x01FF,
+                0x1A00,0x01FF,0x1B00,0x01FF,0x1C00,0x01FF,0x1D00,0x01FF,
+                0x1E00,0x01FF,0x1F00,0x01FF,0x2000,0x01FF,0x2100,0x01FF,
+                0x2200,0x01FF,0x2300,0x01FF,0x2400,0x01FF,0x2500,0x01FF,
+                0x2600,0x01FF,0x2700,0x01FF,0x2800,0x01FF,0x2900,0x01FF,
+                0x2A00,0x01FF,0x2B00,0x01FF,0x2C00,0x01FF,0x2D00,0x01FF,
+                0x2E00,0x01FF,0x2F00,0x01FF,0x3000,0x01FF,0x3100,0x01FF,
+                0x3200,0x01FF,0x3300,0x01FF,0x3400,0x01FF,0x3500,0x01FF,
+                0x3600,0x01FF,0x3700,0x01FF,0x3800,0x01FF,0x3900,0x01FF,
+                0x3A00,0x01FF,0x3B00,0x01FF,0x3C00,0x01FF,0x3D00,0x01FF,
+                0x3E00,0x01FF,0x3F00,0x01FF,0xFF00,0xFF00,0xFF00,0xFF00,
+                0xFF00,0xFF00,0xFF00,0xFF00,0xFF00,0xFF00,0xFF00,0xFF00,
+                0xFF00,0xFF00,0xFF00,0x0000
+            };
+            memset( main_board_.eeprom_, 0xFF, sizeof(main_board_.eeprom_) );
+            unsigned sz = sizeof(gauntlet_default_eeprom) / sizeof(gauntlet_default_eeprom[0]);
+            for( unsigned i = 0; i < sz && i * 2 + 1 < sizeof(main_board_.eeprom_); i++ ) {
+                main_board_.eeprom_[i * 2]     = (gauntlet_default_eeprom[i] >> 8) & 0xFF;
+                main_board_.eeprom_[i * 2 + 1] = gauntlet_default_eeprom[i] & 0xFF;
+            }
+        }
 
         main_board_.reset();
         sound_board_.reset();
     }
 
     main_board_.run();
-    sound_board_.playSound( frame->getMixer(), samplesPerFrame, samplingRate );
-    frame->setVideo( renderVideo() );
 
-    frame_counter_++;
+    frame->setVideo( renderVideo() );
 }
 
 // ===========================================================================
@@ -921,92 +993,98 @@ TBitmapIndexed * Gauntlet::renderVideo()
     }
 
     // === Motion objects (sprites) ===
-    // Linked list format, 1024 entries × 4 words
-    // Word 0 (offset 0x0000): xxxxxxx xxxxxxxx = tile index (15 bits)
-    // Word 1 (offset 0x0800): xxxxxxxx x------- = X position (9 bits), ----xxxx = palette
-    // Word 2 (offset 0x1000): xxxxxxxx x------- = Y position (9 bits), -x------ = hflip,
-    //                          --xxx--- = width-1, -----xxx = height-1
-    // Word 3 (offset 0x1800): ------xx xxxxxxxx = link (10 bits)
+    // 1024 entries x 4 words (component layout: word N of all entries grouped)
+    //   Word 0 (0x0000): -xxxxxxx xxxxxxxx = tile code (15 bits, then ^0x800)
+    //   Word 1 (0x0800): xxxxxxxx x------- = X position; -------- ----xxxx = palette
+    //   Word 2 (0x1000): xxxxxxxx x------- = Y position; -------- -x------ = hflip;
+    //                    -------- --xxx--- = width-1;    -------- -----xxx = height-1
+    //   Word 3 (0x1800): ------xx xxxxxxxx = link to next object
     //
-    // SLIP (Scanline Link Pointer): at 0x905F80-0x905FFF
-    // Each SLIP entry covers 8 scanlines
-    // For simplicity, render all MOs by following the link chain from entry 0
-
+    // SLIP (Scanline Link Pointer) RAM at 0x905F80 (alpha_ offset 0xF80), one
+    // word per 8-scanline band. Each band's chain is followed from its SLIP
+    // link and every object is clipped to that band's 8 scanlines
+    // (slipshift=3, slipoffset=1). Objects scroll with the playfield.
     {
-        bool visited[1024];
-        memset( visited, 0, sizeof(visited) );
+        const int slipShift = 3;      // 8 pixels per SLIP entry
+        const int slipOffset = 1;
+        const int bitmapH = 512;
+        const int bitmapMask = bitmapH - 1;
+        int yscroll = pfScrollY & 0x1FF;
 
-        int entry = 0;
-        int count = 0;
-        while( !visited[entry] && count < 1024 ) {
-            visited[entry] = true;
-            count++;
+        int startband = ((0 + yscroll - slipOffset) & bitmapMask) >> slipShift;
+        int stopband  = ((ScreenHeight - 1 + yscroll - slipOffset) & bitmapMask) >> slipShift;
+        if( startband > stopband )
+            startband -= bitmapH >> slipShift;
 
-            int w0_off = entry * 2;
-            int w1_off = 0x800 + entry * 2;
-            int w2_off = 0x1000 + entry * 2;
-            int w3_off = 0x1800 + entry * 2;
+        for( int band = startband; band <= stopband; band++ ) {
+            int slipIdx = band & 0x3F;
+            unsigned slipWord = (main_board_.alpha_[0xF80 + slipIdx * 2] << 8) |
+                                 main_board_.alpha_[0xF80 + slipIdx * 2 + 1];
+            int link = slipWord & 0x3FF;
 
-            unsigned w0 = (main_board_.motionobj_[w0_off] << 8) | main_board_.motionobj_[w0_off + 1];
-            unsigned w1 = (main_board_.motionobj_[w1_off] << 8) | main_board_.motionobj_[w1_off + 1];
-            unsigned w2 = (main_board_.motionobj_[w2_off] << 8) | main_board_.motionobj_[w2_off + 1];
-            unsigned w3 = (main_board_.motionobj_[w3_off] << 8) | main_board_.motionobj_[w3_off + 1];
+            // Screen-space clip window for this band
+            int clipY0 = ((band << slipShift) - yscroll + slipOffset) & bitmapMask;
+            if( clipY0 >= ScreenHeight ) clipY0 -= bitmapH;
+            int clipY1 = clipY0 + (1 << slipShift);
+            if( clipY0 < 0 ) clipY0 = 0;
+            if( clipY1 > ScreenHeight ) clipY1 = ScreenHeight;
+            if( clipY0 >= clipY1 ) continue;
 
-            int code = w0 & 0x7FFF;
-            code ^= 0x800;
-            int xpos = (w1 >> 7) & 0x1FF;
-            int pal  = w1 & 0x0F;
-            int ypos = (w2 >> 7) & 0x1FF;
-            int hflip = (w2 >> 6) & 1;
-            int width = ((w2 >> 3) & 7) + 1;
-            int height = (w2 & 7) + 1;
-            int link = w3 & 0x3FF;
+            bool visited[1024];
+            memset( visited, 0, sizeof(visited) );
+            int entry = link;
+            int steps = 0;
+            while( !visited[entry] && steps < 1024 ) {
+                visited[entry] = true;
+                steps++;
 
-            // Adjust positions
-            if( xpos >= 0x100 ) xpos -= 0x200;
-            if( ypos >= 0x100 ) ypos -= 0x200;
+                unsigned w0 = (main_board_.motionobj_[entry*2] << 8) | main_board_.motionobj_[entry*2 + 1];
+                unsigned w1 = (main_board_.motionobj_[0x800 + entry*2] << 8) | main_board_.motionobj_[0x800 + entry*2 + 1];
+                unsigned w2 = (main_board_.motionobj_[0x1000 + entry*2] << 8) | main_board_.motionobj_[0x1000 + entry*2 + 1];
+                unsigned w3 = (main_board_.motionobj_[0x1800 + entry*2] << 8) | main_board_.motionobj_[0x1800 + entry*2 + 1];
 
-            // Offset Y by 1 (SLIP offset)
-            ypos += 1;
+                int code   = (w0 & 0x7FFF) ^ 0x800;
+                int xpos   = (w1 >> 7) & 0x1FF;
+                int pal    = w1 & 0x0F;
+                int ypos   = (w2 >> 7) & 0x1FF;
+                int hflip  = (w2 >> 6) & 1;
+                int width  = ((w2 >> 3) & 7) + 1;
+                int height = (w2 & 7) + 1;
+                int nextLink = w3 & 0x3FF;
 
-            // Apply MO scroll
-            xpos -= pfScrollX;
-            ypos -= (pfScrollY & 0x1FF);
+                // Screen position: Y wraps in the 512-tall bitmap, then scroll
+                int sybase = (ypos - yscroll) & bitmapMask;
+                if( sybase >= ScreenHeight ) sybase -= bitmapH;
+                int sxbase = xpos - pfScrollX;
 
-            xpos = ((xpos % 512) + 512) % 512;
-            ypos = ((ypos % 512) + 512) % 512;
+                for( int ty = 0; ty < height; ty++ ) {
+                    for( int tx = 0; tx < width; tx++ ) {
+                        int tile = code + ty + tx * 8;
+                        if( tile < 0 || tile >= 8192 ) continue;
 
-            // Render all tiles in the sprite pixel-by-pixel
-            // MO palette at hw 0x100 + pal * 16
-            for( int ty = 0; ty < height; ty++ ) {
-                for( int tx = 0; tx < width; tx++ ) {
-                    int tile = code + ty + tx * 8;
-                    if( tile < 0 || tile >= 8192 ) continue;
+                        int dx = sxbase + (hflip ? (width - 1 - tx) : tx) * 8;
+                        int dy = sybase + ty * 8;
 
-                    int dx = xpos + (hflip ? (width - 1 - tx) : tx) * 8;
-                    int dy = ypos + ty * 8;
-
-                    if( dx >= ScreenWidth || dy >= ScreenHeight ) continue;
-                    if( dx + 8 <= 0 || dy + 8 <= 0 ) continue;
-
-                    for( int py = 0; py < 8; py++ ) {
-                        int sy = dy + py;
-                        if( sy < 0 || sy >= ScreenHeight ) continue;
-                        for( int px = 0; px < 8; px++ ) {
-                            int sx = dx + (hflip ? (7 - px) : px);
-                            if( sx < 0 || sx >= ScreenWidth ) continue;
-                            unsigned char pix = pfmo_data_.pixel( px, tile * 8 + py );
-                            if( pix == 0 ) continue;
-                            int hwColor = 0x100 + pal * 16 + pix;
-                            unsigned rgb = decodeHWColor(main_board_.palette_, hwColor);
-                            int nearest = palette()->getNearestColor( rgb );
-                            screen()->bits()->setPixel( sx, sy, nearest );
+                        for( int py = 0; py < 8; py++ ) {
+                            int sy = dy + py;
+                            if( sy < clipY0 || sy >= clipY1 ) continue;
+                            for( int px = 0; px < 8; px++ ) {
+                                int sx = dx + (hflip ? (7 - px) : px);
+                                if( sx < 0 || sx >= ScreenWidth ) continue;
+                                unsigned char pix = pfmo_data_.pixel( px, tile * 8 + py );
+                                if( pix == 0 ) continue;
+                                int hwColor = 0x100 + pal * 16 + pix;
+                                unsigned rgb = decodeHWColor(main_board_.palette_, hwColor);
+                                int nearest = palette()->getNearestColor( rgb );
+                                screen()->bits()->setPixel( sx, sy, nearest );
+                            }
                         }
                     }
                 }
-            }
 
-            entry = link;
+                if( nextLink == entry ) break;
+                entry = nextLink;
+            }
         }
     }
 

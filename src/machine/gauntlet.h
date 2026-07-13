@@ -16,6 +16,8 @@
 #include <cpu/m68000.h>
 #include <cpu/n6502.h>
 
+struct GauntletMainBoard;
+
 struct GauntletSoundBoard : public N6502Environment
 {
     GauntletSoundBoard();
@@ -48,6 +50,7 @@ struct GauntletSoundBoard : public N6502Environment
     bool irq_state_;
 
     N6502 * cpu_;
+    GauntletMainBoard * main_board_;
 };
 
 struct GauntletMainBoard : public M68000Environment
@@ -131,9 +134,6 @@ private:
     // Decoded graphics
     TBitBlock alpha_data_;    // 1024 tiles, 8x8, 2bpp
     TBitBlock pfmo_data_;     // 8192 tiles, 8x8, 4bpp
-
-    // VBLANK state
-    int frame_counter_;
 };
 
 #endif // GAUNTLET_H_

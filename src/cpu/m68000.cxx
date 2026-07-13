@@ -607,7 +607,10 @@ unsigned M68000::run( unsigned cycles )
             icount_ = 0;
             break;
         }
+        int old_icount = icount_;
         executeOne();
+        if( icount_ == old_icount )
+            icount_--;  // Ensure forward progress if an opcode reported no cycles
         checkInterrupts();
     }
 

@@ -103,6 +103,8 @@ private:
     
     static Uint32 videoCallbackStub( Uint32 interval, void * param );
     
+    static Uint32 frameTimerStub( Uint32 interval, void * param );
+    
     bool error( const char * info );
     
     void reset();
@@ -119,6 +121,7 @@ private:
     Uint32 user_event_type_;
     SDLMainOptions options_;
     SDL_TimerID video_tid_;
+    SDL_TimerID frame_tid_;
     unsigned frame_delay_;
     SDLFrame * cur_frame_;
     Fifo audio_q_;

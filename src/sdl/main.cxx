@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <map>
 #include "SDL2/SDL.h"
 #include "emu/emu.h"
 #include "sdl_main.h"
@@ -526,6 +527,14 @@ int main(int argc, char** argv) {
 
     running = sdl.go( machine );
 
+    // Input latch: keep each pressed input active for a minimum number of
+    // emulated frames so a brief key tap (e.g. inserting a coin or pressing
+    // start) is always seen by the game, even if the key is pressed and
+    // released within a single frame.
+    const int InputLatchFrames = 4;
+    std::map<int,int>  inputLatch;  // keysym -> frames left to stay pressed
+    std::map<int,bool> inputHeld;   // keysym -> physically held down
+
     // Event loop
     while( running ) {
         SDL_Event e;
@@ -550,6 +559,19 @@ int main(int argc, char** argv) {
 
                             inputManager.notifyJoysticks( machine );
                             sdl.add_frame( machine );
+
+                            // Expire input latches: release keys whose latch
+                            // has counted down and are no longer held.
+                            for( std::map<int,int>::iterator it = inputLatch.begin(); it != inputLatch.end(); ) {
+                                if( it->second > 0 ) it->second--;
+                                if( it->second == 0 && ! inputHeld[it->first] ) {
+                                    inputManager.handle( it->first, 0, machine );
+                                    inputLatch.erase( it++ );
+                                }
+                                else {
+                                    ++it;
+                                }
+                            }
                             break;
 
                         case SDLTickleEvent_RenderTexture:
@@ -567,13 +589,21 @@ int main(int argc, char** argv) {
                     break;
 
                 case SDL_KEYUP:
-                    if( ! inputManager.handle( e.key.keysym.sym, 0, machine ) ) {
-                        // Unhandled key
+                    inputHeld[e.key.keysym.sym] = false;
+                    // If the key is still within its minimum-hold latch window,
+                    // defer the release until the latch expires (handled after
+                    // add_frame); otherwise release it now.
+                    if( inputLatch.find( e.key.keysym.sym ) == inputLatch.end() ) {
+                        inputManager.handle( e.key.keysym.sym, 0, machine );
                     }
                     break;
 
                 case SDL_KEYDOWN:
-                    if( ! inputManager.handle( e.key.keysym.sym, 1, machine ) ) {
+                    if( inputManager.handle( e.key.keysym.sym, 1, machine ) ) {
+                        inputHeld[e.key.keysym.sym] = true;
+                        inputLatch[e.key.keysym.sym] = InputLatchFrames;
+                    }
+                    else {
                         // Unhandled key
                         switch( e.key.keysym.sym ) {
                             case SDLK_ESCAPE:

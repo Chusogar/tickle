@@ -21,6 +21,7 @@ void SDLMain::reset() {
     adid_ = 0;
     frame_delay_ = 0;
     video_tid_ = 0;
+    frame_tid_ = 0;
     int maxj = sizeof(joystick_) / sizeof(joystick_[0]);
     for( int i=0; i<maxj; i++ ) {
         joystick_[i] = 0;
@@ -71,7 +72,8 @@ bool SDLMain::init( const SDLMainOptions & options ) {
         adid_ = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0 );
         
         if( adid_ == 0 ) {
-            ok = error( "Cannot open audio device" );
+            printf( "Cannot open audio device: %s\n", SDL_GetError() );
+            // Continue without audio
         }
     }
     
@@ -181,7 +183,17 @@ void SDLMain::add_frame( TMachine * machine ) {
     int audioSamplesPerFrame = options_.audiofreq / machine->getDriverInfo()->machineInfo()->framesPerSecond;
     SDLFrame * frame = new SDLFrame( rend_, audioSamplesPerFrame );
     machine->run( frame, audioSamplesPerFrame, options_.audiofreq );
-    add_frame( frame );
+    if( adid_ != 0 ) {
+        add_frame( frame );
+    } else {
+        // No audio: render directly and discard
+        SDL_Texture * t = frame->getAndDetachTexture();
+        if( t != 0 ) {
+            render( t );
+            SDL_DestroyTexture( t );
+        }
+        delete frame;
+    }
 }
 
 void SDLMain::add_frame( SDLFrame * frame ) {
@@ -225,20 +237,31 @@ bool SDLMain::joystick_status( int joystick, Sint16 * x, Sint16 * y, unsigned * 
     return ok;
 }
 
+Uint32 SDLMain::frameTimerStub( Uint32 interval, void * param ) {
+    SDLMain * sdl = (SDLMain *) param;
+    sdl->push_user_event( SDLTickleEvent_AddFrame );
+    return sdl->frame_delay_;
+}
+
 bool SDLMain::go( TMachine * machine ) {
     int audioSamplesPerFrame = options_.audiofreq / machine->getDriverInfo()->machineInfo()->framesPerSecond;
     
-    // Initialize the frame queue with enough frames
-    for( int n=0; n<audioSamplesPerFrame; n+=SamplesPerCallback ) {
-        add_frame( machine );
-    }
-    add_frame( machine );
-    
     frame_delay_ = 1000 / machine->getDriverInfo()->machineInfo()->framesPerSecond;
     
-    cur_frame_ = new SDLFrame( rend_, 0 );
-    
-    audio_play();
+    if( adid_ != 0 ) {
+        // Audio-driven frame generation
+        for( int n=0; n<audioSamplesPerFrame; n+=SamplesPerCallback ) {
+            add_frame( machine );
+        }
+        add_frame( machine );
+        cur_frame_ = new SDLFrame( rend_, 0 );
+        audio_play();
+    } else {
+        // No audio: use a timer to drive frame generation
+        add_frame( machine );
+        cur_frame_ = 0;
+        frame_tid_ = SDL_AddTimer( frame_delay_, frameTimerStub, this );
+    }
     
     return true;
 }
