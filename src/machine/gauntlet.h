@@ -15,6 +15,9 @@
 #include <emu/emu_standard_machine.h>
 #include <cpu/m68000.h>
 #include <cpu/n6502.h>
+#include <sound/ym2151.h>
+#include <sound/pokey.h>
+#include <sound/tms5220.h>
 
 struct GauntletMainBoard;
 
@@ -30,6 +33,7 @@ struct GauntletSoundBoard : public N6502Environment
     void writeByte( unsigned addr, unsigned char value );
 
     void playSound( TMixer * mixer, unsigned len, unsigned samplingRate );
+    void createChips( unsigned samplingRate );
 
     // Sound CPU ROM (48KB: 0x4000-0xFFFF)
     unsigned char rom_[0xC000];
@@ -48,6 +52,18 @@ struct GauntletSoundBoard : public N6502Environment
 
     // IRQ state
     bool irq_state_;
+
+    // Sound chips
+    TYM2151 * ym2151_;
+    TPokey * pokey_;
+    TTMS5220 * tms5220_;
+
+    // Scratch buffers for per-frame sample generation
+    short * ymBuf_;
+    short * pokeyBuf_;
+    short * tmsBuf_;
+    int chipBufLen_;
+    void ensureChipBuffers( int len );
 
     N6502 * cpu_;
     GauntletMainBoard * main_board_;

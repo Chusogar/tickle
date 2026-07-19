@@ -68,6 +68,14 @@ GauntletSoundBoard::GauntletSoundBoard()
     coin_inputs_ = 0xFF;
     irq_state_ = false;
 
+    ym2151_ = 0;
+    pokey_ = 0;
+    tms5220_ = 0;
+    ymBuf_ = 0;
+    pokeyBuf_ = 0;
+    tmsBuf_ = 0;
+    chipBufLen_ = 0;
+
     memset( rom_, 0xFF, sizeof(rom_) );
     memset( ram_, 0, sizeof(ram_) );
 }
@@ -75,6 +83,25 @@ GauntletSoundBoard::GauntletSoundBoard()
 GauntletSoundBoard::~GauntletSoundBoard()
 {
     delete cpu_;
+    delete ym2151_;
+    delete pokey_;
+    delete tms5220_;
+    delete [] ymBuf_;
+    delete [] pokeyBuf_;
+    delete [] tmsBuf_;
+}
+
+void GauntletSoundBoard::ensureChipBuffers( int len )
+{
+    if( len > chipBufLen_ ) {
+        delete [] ymBuf_;
+        delete [] pokeyBuf_;
+        delete [] tmsBuf_;
+        ymBuf_ = new short [ len ];
+        pokeyBuf_ = new short [ len ];
+        tmsBuf_ = new short [ len ];
+        chipBufLen_ = len;
+    }
 }
 
 void GauntletSoundBoard::reset()
@@ -91,6 +118,10 @@ void GauntletSoundBoard::reset()
     cmd_pending_ = false;
     resp_pending_ = false;
     irq_state_ = false;
+
+    if( ym2151_ ) ym2151_->reset();
+    if( pokey_ ) pokey_->reset();
+    if( tms5220_ ) tms5220_->reset();
 }
 
 /*
@@ -142,13 +173,17 @@ unsigned char GauntletSoundBoard::readByte( unsigned addr )
         return status;
     }
 
-    // POKEY (0x1800-0x180F) - stub
+    // POKEY (0x1800-0x180F)
     if( addr >= 0x1800 && addr < 0x1810 )
-        return 0;
+        return pokey_ ? pokey_->readReg( addr & 0x0F ) : 0;
 
-    // YM2151 (0x1810-0x1811) - stub: not busy
+    // YM2151 (0x1810-0x1811): status read
     if( addr >= 0x1810 && addr < 0x1820 )
-        return 0;
+        return ym2151_ ? ym2151_->readStatus() : 0;
+
+    // TMS5220 (0x1820): status read
+    if( addr >= 0x1820 && addr < 0x1830 )
+        return tms5220_ ? tms5220_->readStatus() : 0;
 
     // IRQ acknowledge (0x1830)
     if( addr >= 0x1830 && addr < 0x1840 ) {
@@ -194,17 +229,28 @@ void GauntletSoundBoard::writeByte( unsigned addr, unsigned char value )
     if( addr >= 0x1030 && addr < 0x1040 )
         return;
 
-    // POKEY (0x1800-0x180F) - stub
-    if( addr >= 0x1800 && addr < 0x1810 )
+    // POKEY (0x1800-0x180F)
+    if( addr >= 0x1800 && addr < 0x1810 ) {
+        if( pokey_ ) pokey_->writeReg( addr & 0x0F, value );
         return;
+    }
 
-    // YM2151 (0x1810-0x1811) - stub
-    if( addr >= 0x1810 && addr < 0x1820 )
+    // YM2151 (0x1810-0x1811): 0x1810 = address latch, 0x1811 = data
+    if( addr >= 0x1810 && addr < 0x1820 ) {
+        if( ym2151_ ) {
+            if( addr & 1 )
+                ym2151_->writeData( value );
+            else
+                ym2151_->writeAddress( value );
+        }
         return;
+    }
 
-    // TMS5220 data (0x1820) - stub
-    if( addr >= 0x1820 && addr < 0x1830 )
+    // TMS5220 data (0x1820)
+    if( addr >= 0x1820 && addr < 0x1830 ) {
+        if( tms5220_ ) tms5220_->writeData( value );
         return;
+    }
 
     // IRQ acknowledge (0x1830)
     if( addr >= 0x1830 && addr < 0x1840 ) {
@@ -219,24 +265,44 @@ void GauntletSoundBoard::run( unsigned cycles )
         cpu_->run( cycles );
 }
 
+void GauntletSoundBoard::createChips( unsigned samplingRate )
+{
+    if( ym2151_ ) return;   // already created
+    if( samplingRate == 0 ) samplingRate = 44100;
+
+    // Gauntlet sound clocks (14.318 MHz Atari master clock):
+    //   YM2151  = 14.318 MHz / 4 = 3.579 MHz
+    //   POKEY   = 14.318 MHz / 8 = 1.790 MHz
+    ym2151_  = new TYM2151( 3579545, samplingRate );
+    pokey_   = new TPokey( 1789790, samplingRate );
+    tms5220_ = new TTMS5220();
+}
+
 void GauntletSoundBoard::playSound( TMixer * mixer, unsigned len, unsigned samplingRate )
 {
-    if( sound_cpu_reset_ ) return;
+    // The sound CPU is stepped by GauntletMainBoard::run() (interleaved with the
+    // main CPU); here we only render the audio the chips produced this frame.
+    if( mixer == 0 || len == 0 || samplingRate == 0 ) return;
+    if( ym2151_ == 0 ) return;
 
-    // Run sound CPU with scanline-based IRQ timing
-    // Sound IRQ is on 32V (every 32 scanlines)
-    // 262 scanlines per frame, IRQ at scanlines where (scanline & 32) is true
-    unsigned cyclesPerScanline = SoundCpuCyclesPerFrame / 262;
-    for( int scanline = 0; scanline < 262; scanline++ ) {
-        cpu_->run( cyclesPerScanline );
-        if( scanline & 32 ) {
-            if( !irq_state_ ) {
-                irq_state_ = true;
-                cpu_->interrupt( N6502::Int_IRQ );
-            }
-        } else {
-            irq_state_ = false;
-        }
+    ensureChipBuffers( (int)len );
+
+    ym2151_->update( ymBuf_, (int)len );
+    pokey_->update( pokeyBuf_, (int)len );
+    tms5220_->update( tmsBuf_, (int)len, samplingRate );
+
+    // Three voices mixed into one mono buffer. Each chip is scaled down to
+    // roughly +/-256 so the SDL mixer (which multiplies by 128/voices) yields a
+    // well-scaled 16-bit signal without harsh clipping.
+    const int voices = 3;
+    TMixerBuffer * mixerBuffer = mixer->getBuffer( chMono, len, voices );
+    int * dest = mixerBuffer->data();
+
+    for( unsigned i = 0; i < len; i++ ) {
+        int ym    = (int)ymBuf_[i] >> 7;                 // +/-32768 -> +/-256
+        int pk    = ( (int)pokeyBuf_[i] - 16384 ) >> 6;  // 0..32767 -> ~ +/-256
+        int voice = (int)tmsBuf_[i] >> 7;                // +/-32768 -> +/-256
+        dest[i] += ym + pk + voice;
     }
 }
 
@@ -801,7 +867,13 @@ void Gauntlet::run( TFrame * frame, unsigned samplesPerFrame, unsigned samplingR
         sound_board_.reset();
     }
 
+    // Create the sound chips before running the CPUs so sound-CPU register
+    // writes during main_board_.run() are captured.
+    sound_board_.createChips( samplingRate ? samplingRate : 44100 );
+
     main_board_.run();
+
+    sound_board_.playSound( frame->getMixer(), samplesPerFrame, samplingRate );
 
     frame->setVideo( renderVideo() );
 }

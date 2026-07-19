@@ -4,6 +4,9 @@ PLAIN_OBJECTS = \
 	rcfilter.o \
 	sn76477.o \
 	ym2149.o \
+	ym2151.o \
+	pokey.o \
+	tms5220.o \
 	waveform.o
 
 OBJECTS = $(addprefix $(OBJDIR),$(PLAIN_OBJECTS))
