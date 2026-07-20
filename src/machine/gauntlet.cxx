@@ -699,13 +699,14 @@ Gauntlet::Gauntlet() :
     refresh_roms_ = true;
 
     // Player 1 joystick + buttons (port_in_[0])
-    // Bits: UP=0x80, DOWN=0x40, LEFT=0x20, RIGHT=0x10, B2/START=0x01, B1=0x02
-    setJoystickHandler( 0, new TJoystickToPortHandler(idJoyP1Joystick1, ptInverted, jm8Way, &main_board_.port_in_[0], 0x80402010) );
+    // Bits (MAME gauntlet): UP=0x80, DOWN=0x40, LEFT=0x20, RIGHT=0x10, B2/START=0x01, B1=0x02
+    // Packed mask is byte-ordered jpLeft,jpRight,jpUp,jpDown (LSB first).
+    setJoystickHandler( 0, new TJoystickToPortHandler(idJoyP1Joystick1, ptInverted, jm8Way, &main_board_.port_in_[0], 0x40801020) );
     eventHandler()->add( idKeyP1Action1,    ptInverted, &main_board_.port_in_[0], 0x02 );
     eventHandler()->add( idKeyStartPlayer1, ptInverted, &main_board_.port_in_[0], 0x01 );
 
     // Player 2 joystick + buttons (port_in_[1])
-    setJoystickHandler( 1, new TJoystickToPortHandler(idJoyP2Joystick1, ptInverted, jm8Way, &main_board_.port_in_[1], 0x80402010) );
+    setJoystickHandler( 1, new TJoystickToPortHandler(idJoyP2Joystick1, ptInverted, jm8Way, &main_board_.port_in_[1], 0x40801020) );
     eventHandler()->add( idKeyP2Action1,    ptInverted, &main_board_.port_in_[1], 0x02 );
     eventHandler()->add( idKeyStartPlayer2, ptInverted, &main_board_.port_in_[1], 0x01 );
 
